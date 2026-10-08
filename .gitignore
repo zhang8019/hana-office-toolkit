@@ -1,0 +1,17 @@
+# 打包产物
+dist/
+dist-market/
+*.zip
+*.entry.json
+
+# 依赖与缓存
+node_modules/
+.cache/
+*.log
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store

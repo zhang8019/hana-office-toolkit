@@ -1,0 +1,27 @@
+{
+  "manifestVersion": 2,
+  "id": "office-toolkit",
+  "name": "Office 工具箱",
+  "version": "0.7.0",
+  "entry": "index.js",
+  "capabilities": [
+    "app/tools.expose-to-model",
+    "app/process.spawn",
+    "app/mcp.provide"
+  ],
+  "contributes": {
+    "cards": [
+      {
+        "id": "panel",
+        "title": "Office 工具箱",
+        "description": "桥接 officecli、托管 timeverse-office-doc MCP，并提供文档转换（含 PDF/HTML/CSV 等）：状态诊断、依赖自检、批量转换收在一张面板卡上。",
+        "route": "/panel.html",
+        "face": { "image": "assets/cover.svg" }
+      }
+    ]
+  },
+  "icon": "assets/icon.svg",
+  "description": "Office 工具箱：桥接本机 officecli，随包托管 timeverse-office-doc MCP（74 项文档工具），并提供文档转换（旧格式现代化 + PDF/HTML/CSV 等任意目标）。首次使用可运行依赖自检，按提示补齐 LibreOffice / uv。",
+  "minAppVersion": "1.0.6-beta"
+}
+
