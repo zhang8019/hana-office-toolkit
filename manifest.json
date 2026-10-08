@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "office-toolkit",
   "name": "Office 工具箱",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "entry": "index.js",
   "capabilities": [
     "app/tools.expose-to-model",
@@ -18,10 +18,49 @@
         "route": "/panel.html",
         "face": { "image": "assets/cover.svg" }
       }
-    ]
+    ],
+    "settings": {
+      "title": "Office 工具箱",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "engine": {
+            "type": "string",
+            "title": "默认转换引擎",
+            "description": "auto = MS Office → WPS → LibreOffice（推荐，保真优先；Word/WPS 能保住原件版式）。也可强制单一引擎：office / wps / libreoffice。",
+            "enum": ["auto", "office", "wps", "libreoffice"],
+            "enumLabels": [
+              "自动（MS Office → WPS → LibreOffice）",
+              "仅 MS Office",
+              "仅 WPS",
+              "仅 LibreOffice"
+            ],
+            "default": "auto",
+            "scope": "global"
+          },
+          "targetFormat": {
+            "type": "string",
+            "title": "默认目标格式",
+            "description": "留空 = 旧格式默认映射（.doc/.rtf→.docx、.xls→.xlsx、.ppt→.pptx）。填 pdf/docx/xlsx/pptx/html/txt/csv/rtf/odt/ods/odp/epub/md 则转换默认输出该格式（会转换输入内所有可识别文档）。",
+            "default": "",
+            "scope": "global"
+          },
+          "mode": {
+            "type": "string",
+            "title": "原件处理方式",
+            "description": "keep = 保留原件（默认）；backup = 原件移入「旧格式文件」目录；replace = 删除原件（工具侧仍需显式确认）。",
+            "enum": ["keep", "backup", "replace"],
+            "enumLabels": ["保留原件", "移入 old-format-files", "删除原件"],
+            "default": "keep",
+            "scope": "global"
+          }
+        }
+      }
+    }
   },
   "icon": "assets/icon.svg",
   "description": "Office 工具箱：桥接本机 officecli，随包托管 timeverse-office-doc MCP（74 项文档工具），并提供文档转换（旧格式现代化 + PDF/HTML/CSV 等任意目标）。首次使用可运行依赖自检，按提示补齐 LibreOffice / uv。",
   "minAppVersion": "1.0.6-beta"
 }
+
 

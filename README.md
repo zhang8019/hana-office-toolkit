@@ -31,14 +31,15 @@
 | .csv → .xlsx | ✓ |
 | 混合目录（doc/xls/ppt/csv）→ pdf | ✓ 4/4，按家族自动选 writer/calc/impress PDF 过滤器 |
 
-**引擎能力边界**：LibreOffice 覆盖全部目标格式；有 Office/WPS 但没 LibreOffice 时，只剩“旧格式→现代格式”和“导出 PDF”两条路，其余目标格式会明确提示需要 LibreOffice。
+**引擎能力边界**：MS Office/WPS 覆盖「旧格式→现代格式」与「导出 PDF」；其余目标格式（html/csv/txt/rtf/odt/ods/odp/epub/md）只有 LibreOffice 能做。
 
-PDF、HTML、CSV 等输出由本机 LibreOffice 提供，**officecli 本身做不到**（它只管 docx/xlsx/pptx 的增删改查）。
+旧格式现代化与导出 PDF 走 Word/WPS；HTML/CSV/TXT 等由 LibreOffice 提供。**officecli 本身不做转换**（它只管 docx/xlsx/pptx 的增删改查），而且**它看不见老式 VML 浮动图**（只认新版 DrawingML）。
 
 **已知边界**：
 - 递归目录里同名文件（如 `demo.ppt` 与 `demo.pptx`）转成同一目标格式会撞名，后者会被跳过。
 - 目标文件已存在时跳过，不静默覆盖。
 - PDF 作为输入（PDF→Office）只有 LibreOffice Draw 的失真导入，本版不做。
+- **officecli 看不见老式 VML 浮动图**（`w:pict`/`v:shape`）：`view outline` 会报 0 images、`query picture` 返回空。这类图要用 `raw`/`raw-set` 手工处理，或交给 Word/WPS 转换；officecli 生成的图是新版 DrawingML，也带不上原件那种边框属性。
 
 ## 面板
 
@@ -47,11 +48,24 @@ PDF、HTML、CSV 等输出由本机 LibreOffice 提供，**officecli 本身做�
 ## 依赖与环境
 
 - **officecli**：默认探测 `%LOCALAPPDATA%\OfficeCli\officecli.exe`，可用环境变量 `OFFICECLI_PATH` 覆盖。
-- **旧文档转换引擎（自动选择）**：
-  1. **LibreOffice headless（推荐）**：检测 `%ProgramFiles%\LibreOffice\program\soffice.exe`；命令 `soffice --headless --convert-to docx|xlsx|pptx --outdir <目录> <文件>`，每个文件独立 `-env:UserInstallation` profile，不干扰你自己开着的 LibreOffice。不依赖 Office、不吃桌面，实测 30 份 .doc 约 1 分钟。
-  2. **Office COM 兜底**：WPS（`KWPS/KET/KWPP.Application`）→ MS Office（`Word/Excel/PowerPoint.Application`）。仅在无 LibreOffice（或 `engine` 强制）时使用；Word 自动化在无界面子进程下会空转，不要依赖它。
-  3. 可用 `engine` 参数强制：`auto`（默认）/`libreoffice`/`wps`/`office`。
+- **转换引擎（自动顺序：MS Office → WPS → LibreOffice）**：
+  1. **MS Office COM**（`Word/Excel/PowerPoint.Application`）：旧格式→现代格式、导出 PDF。**优先**，因为它能保住原件版式。
+  2. **WPS COM**（`KWPS/KET/KWPP.Application`）：同上，第二顺位。
+  3. **LibreOffice headless**：其余目标格式（html/csv/txt/rtf/odt/ods/odp/epub/md）只有它能做；也是 COM 失败时的回落。
+  4. 可用 `engine` 参数强制：`auto`（默认）/`office`/`wps`/`libreoffice`。任务结果里会报出**实际使用的引擎**。
+
+  **为什么 COM 要走特殊通道**：Office/WPS 的自动化会拒绝“已提升”的调用方（报 `0x800702E4`，字面像“需要提升”，实际是相反意思）；WPS 的 per-user 注册还会被限制性执行环境隔离（报 `0x80040154`）。所以 COM 一律由 `explorer.exe` 派生的**非提升、脱离隔离**子进程执行，进度与结果经文件回传；失败自动回落 LibreOffice。**不要去改 DCOM / 组策略 / 注册表**——那是错方向。
 - **PowerShell**：优先 `pwsh`，回退 `powershell.exe`。脚本纯 ASCII，兼容 5.1；子进程环境精简时脚本会补齐 `PATHEXT`。
+
+## 自动清理（僵尸进程与临时文件）
+
+Office/WPS 的自动化实例在异常路径上会泄漏（微软自己的 server-side Automation 文档就把这点列为不支持服务端自动化的理由之一：实例一旦泄漏，之后该应用的调用会集体卡死）。本 App 的做法是**用前清一次、用后清一次**，把残留掐在萌芽：
+
+- **判断依据**：自动化实例没有主窗口标题；你自己打开着的 Word/Excel/WPS 文档有标题，因而不受影响。LibreOffice 是例外（`soffice.bin` 即使在有窗口时也是它），所以只清命令行里带我方 `lo_profile_*` 标记的实例。
+- **用前**：任务启动前先做一次无窗口残留清扫，避免上一轮崩溃留下的实例把这一轮拖死。
+- **用后**：任务结束（含取消/超时）后，按“启动前快照 → 结束后快照”的差集精确结束本轮新起的进程，再兜一次无窗口清扫；临时目录（`ot_com_*` / `unelevated_*` / `lo_profile_*` / `officecli_probe_*`，仅限一小时前的）一并清掉。
+- **手动兜底**：工具 `office_cleanup`（需 `confirm=true`），面板里对应「清理」按钮。
+- **实现要点**：App 运行在受限执行环境里，进程视图受限，看不到（也就杀不掉）外部起的实例；因此清扫与 COM 走同一条 `explorer.exe` 派生通道，在隔离之外执行。
 
 ## 首次使用（在新电脑上装）
 
@@ -65,7 +79,7 @@ PDF、HTML、CSV 等输出由本机 LibreOffice 提供，**officecli 本身做�
 
 设计原则：**缺哪个就只少哪一块**，不会因为少一样就整个 App 不能用。
 
-- 没有 LibreOffice、但有 WPS/MS Office：**仅能**做旧格式→现代格式，以及导出 PDF（走 COM 兜底）。其余目标格式（html/csv/txt/odt/epub…）一律需要 LibreOffice。且 Word 自动化在无界面子进程下实测会**空转**，兜底只能算“有总比没有强”，**不推荐长期依赖**
+- 没有 LibreOffice、但有 WPS/MS Office：**能**做旧格式→现代格式与导出 PDF（走 COM，经 explorer 降权子进程）；其余目标格式仍需 LibreOffice。两者都没有：转换功能完全不可用。
 - 没有 officecli：转换功能照常，只是不能读写 docx/xlsx/pptx
 - 没有 uv：托管的那套 MCP 工具不出现，App 自己的工具不受影响
 

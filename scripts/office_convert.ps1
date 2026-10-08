@@ -16,7 +16,22 @@
 # permission model and must not touch user directories directly.
 
 param(
-    [Parameter(Mandatory = $true)][string]$JobFile
+    [string]$JobFile = "",
+    # Internal: worker mode. Runs ONLY the Office/WPS COM conversion, reporting progress and the
+    # final result through files. Used because COM needs a caller that is BOTH non-elevated AND
+    # outside the Hana sandbox; we get that by launching this script again via explorer.exe.
+    [switch]$ComWorker,
+    # Internal: sweep transient temp dirs left by earlier runs, then exit.
+    [switch]$SweepTemp,
+    # Internal: list running Office / soffice processes (pid, name, has window), then exit.
+    [switch]$ListOfficePids,
+    # Internal: sweep worker mode (launched via explorer by the parent), then exit.
+    [switch]$SweepWorker,
+    [string]$WorkerAction = "sweep",
+    [string]$ProgressFile = "",
+    [string]$ResultFile = "",
+    [string]$DoneFlag = "",
+    [string]$WorkerPidFile = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,6 +39,112 @@ $ErrorActionPreference = "Stop"
 # The app child process can have a lean environment; without PATHEXT PowerShell will not treat
 # ".exe" as an executable and the call operator fails with "cannot run a document".
 if (-not $env:PATHEXT) { $env:PATHEXT = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC" }
+$script:ProgressFile = $ProgressFile
+
+function Get-ZombieProcs {
+    # An Office automation instance has no main window; a document the user opened does. This is the
+    # standard way to tell a leftover apart from real work, and it is why we can safely auto-clean.
+    # LibreOffice is the exception: soffice.bin is the real process behind a visible window too, so
+    # for it we only take instances whose command line carries our own profile marker.
+    $names = @("WINWORD", "EXCEL", "POWERPNT", "wps", "et", "wpp", "soffice", "soffice.bin")
+    $procs = @()
+    foreach ($n in $names) {
+        Get-Process -Name $n -ErrorAction SilentlyContinue | ForEach-Object {
+            $procs += [pscustomobject]@{ pid = $_.Id; name = $_.ProcessName; title = [string]$_.MainWindowTitle }
+        }
+    }
+    return $procs
+}
+
+function Test-KillableZombie($p) {
+    if ($p.name -like "soffice*") {
+        try {
+            $cl = (Get-CimInstance Win32_Process -Filter ("ProcessId=" + $p.pid) -ErrorAction SilentlyContinue).CommandLine
+            return ($cl -and ($cl -match "lo_profile_"))
+        } catch { return $false }
+    }
+    return (-not ([string]$p.title).Trim())
+}
+
+function Invoke-SweepWorker($action) {
+    # The parent runs INSIDE the Hana sandbox, whose restricted process view cannot see (and
+    # therefore cannot kill) Office instances started elsewhere. explorer.exe runs outside the
+    # sandbox, so we hop through it exactly like the COM worker does, and read the answer back
+    # from a file. VBS + window style 0 keeps the hop silent.
+    $tmp = Join-Path $env:TEMP ("ot_sweep_" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+    $res = Join-Path $tmp 'sweep.json'
+    $done = Join-Path $tmp 'done.flag'
+    $vbs = Join-Path $tmp 'sweep.vbs'
+    $self = $PSCommandPath
+    if (-not $self) { $self = $MyInvocation.MyCommand.Path }
+    $cmdLine = "pwsh -NoProfile -ExecutionPolicy Bypass -File `"$self`" -SweepWorker -WorkerAction $action -ResultFile `"$res`" -DoneFlag `"$done`""
+    Set-Content -LiteralPath $vbs -Value ('CreateObject("WScript.Shell").Run "' + ($cmdLine -replace '"', '""') + '", 0, False') -Encoding ascii
+    try { Start-Process -FilePath "explorer.exe" -ArgumentList "`"$vbs`"" -WindowStyle Hidden | Out-Null } catch { }
+    $deadline = (Get-Date).AddSeconds(25)
+    while (-not (Test-Path -LiteralPath $done)) {
+        if ((Get-Date) -gt $deadline) { break }
+        Start-Sleep -Milliseconds 300
+    }
+    $obj = $null
+    if (Test-Path -LiteralPath $res) { try { $obj = Get-Content -LiteralPath $res -Raw -Encoding UTF8 | ConvertFrom-Json } catch { } }
+    Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    return $obj
+}
+
+if ($SweepWorker) {
+    # Runs outside the sandbox: sees every process, may delete temp dirs and kill zombies.
+    $payload = [ordered]@{ ok = $true; action = $WorkerAction; removed = 0; procs = @(); killed = @() }
+    try {
+        if ($WorkerAction -ne 'list') {
+            $cut = (Get-Date).AddHours(-1)
+            foreach ($pat in @("ot_com_*", "unelevated_*", "lo_profile_*", "officecli_probe_*")) {
+                Get-ChildItem -LiteralPath $env:TEMP -Directory -Filter $pat -ErrorAction SilentlyContinue | ForEach-Object {
+                    if ($_.LastWriteTime -lt $cut) {
+                        try { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue; $payload.removed++ } catch { }
+                    }
+                }
+            }
+        }
+        $procs = @(Get-ZombieProcs)
+        $payload.procs = $procs
+        if ($WorkerAction -ne 'list') {
+            $killed = @()
+            foreach ($p in $procs) {
+                if (Test-KillableZombie $p) {
+                    try { & taskkill.exe /PID $p.pid /T /F 2>$null | Out-Null; $killed += $p.pid } catch { }
+                }
+            }
+            $payload.killed = $killed
+        }
+    } catch {
+        $payload.ok = $false
+        $payload.error = $_.Exception.Message
+    }
+    # -Depth must cover procs[].pid/name/title so they are not collapsed into strings.
+    $json = $payload | ConvertTo-Json -Depth 6 -Compress
+    if (-not $json) { $json = '{"ok":false}' }
+    $json | Set-Content -LiteralPath $ResultFile -Encoding UTF8
+    if ($DoneFlag) { "done" | Set-Content -LiteralPath $DoneFlag -Encoding ascii }
+    exit 0
+}
+
+if ($SweepTemp -or $ListOfficePids) {
+    # Parent side: hop outside the sandbox, then answer. Falls back to a local look if the hop
+    # fails, so a broken explorer path degrades instead of hanging.
+    $action = if ($ListOfficePids) { 'list' } else { 'sweep' }
+    $r = Invoke-SweepWorker $action
+    if (-not $r) { $r = [pscustomobject]@{ ok = $false; procs = @(Get-ZombieProcs); removed = 0; killed = @() } }
+    $procList = @($r.procs | Where-Object { $_ -ne $null })
+    if ($ListOfficePids) {
+        if ($procList.Count -eq 0) { "[]" } else { ConvertTo-Json -InputObject $procList -Depth 4 -Compress }
+    } else {
+        ([pscustomobject]@{ ok = $true; removed = [int]$r.removed; procs = $procList; killed = @($r.killed | Where-Object { $_ -ne $null }) }) | ConvertTo-Json -Depth 6 -Compress
+    }
+    exit 0
+}
+
+if (-not $JobFile) { ([pscustomobject]@{ ok = $false; error = "JobFile is required unless -SweepTemp is used." }) | ConvertTo-Json -Compress; exit 0 }
 
 $job = Get-Content -LiteralPath $JobFile -Raw -Encoding UTF8 | ConvertFrom-Json
 $inputPath = [string]$job.input
@@ -78,7 +199,11 @@ $results = New-Object System.Collections.ArrayList
 function Write-ProgressJson($phase, $current, $total, $file, $officePid) {
     $fileB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$file))
     if (-not $officePid) { $officePid = 0 }
-    $payload = [pscustomobject]@{ phase = $phase; current = $current; total = $total; fileB64 = $fileB64; officePid = [int]$officePid } | ConvertTo-Json -Compress
+    $payload = [pscustomobject]@{ phase = $phase; current = $current; total = $total; fileB64 = $fileB64; officePid = [int]$officePid; workerPid = $PID } | ConvertTo-Json -Compress
+    if ($script:ProgressFile) {
+        # Worker mode: the parent tails this file and re-emits the lines on its own stderr.
+        try { Add-Content -LiteralPath $script:ProgressFile -Value ("OFFICE_PROGRESS:$payload") -Encoding UTF8 } catch { }
+    }
     [Console]::Error.WriteLine("OFFICE_PROGRESS:$payload")
 }
 
@@ -195,7 +320,19 @@ try {
     Remove-Item -LiteralPath $probeFile -Force
     $tempProbe = "writable"
 } catch { $tempProbe = "FAILED: " + $_.Exception.Message }
-$envInfo = "TEMP=$($env:TEMP) | USERPROFILE=$($env:USERPROFILE) | SESSIONNAME=$($env:SESSIONNAME) | ProgramFiles=$($env:ProgramFiles) | probe=$tempProbe"
+$wid = [Security.Principal.WindowsIdentity]::GetCurrent()
+$isAdm = (New-Object Security.Principal.WindowsPrincipal($wid)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+$hasAdmSid = ($wid.Groups | Where-Object { $_.Value -eq 'S-1-5-32-544' }).Count -gt 0
+$admAttr = "n/a"; $lvlAttr = "n/a"
+try {
+    $whoamiExe = Join-Path $env:SystemRoot "System32\whoami.exe"
+    $wa = & $whoamiExe /groups 2>$null
+    $al = $wa | Select-String -Pattern 'S-1-5-32-544' | Select-Object -First 1
+    $ll = $wa | Select-String -Pattern 'S-1-16-' | Select-Object -First 1
+    if ($al) { $admAttr = ([string]$al.Line).Trim() -replace '\s+', '~' }
+    if ($ll) { $lvlAttr = ([string]$ll.Line).Trim() -replace '\s+', '~' }
+} catch { }
+$envInfo = "TEMP=$($env:TEMP) | USERPROFILE=$($env:USERPROFILE) | ProgramFiles=$($env:ProgramFiles) | probe=$tempProbe | IsAdmin=$isAdm | TokenHasAdminSid=$hasAdmSid | admGroup=$admAttr | integrity=$lvlAttr"
 Write-ProgressJson "env" 0 $totalItems $envInfo 0
 Write-ProgressJson "enumerated" 0 $totalItems "" 0
 $script:progressCurrent = 0
@@ -218,13 +355,13 @@ function Get-NewPid($names, $beforeIds) {
     return 0
 }
 
-# Engine preference (from job.engine): "auto" tries WPS first then MS Office;
-# "wps" forces WPS; "office" forces Microsoft Office.
+# Engine preference (from job.engine): "auto" tries Microsoft Office first, then WPS;
+# "wps" forces WPS; "office" forces Microsoft Office. Word/WPS keep legacy layout, so they lead.
 function New-OfficeApp($wpsProgIds, $msProgIds) {
     $order = switch ($enginePref) {
         "wps" { $wpsProgIds }
         "office" { $msProgIds }
-        default { @($wpsProgIds) + @($msProgIds) }
+        default { @($msProgIds) + @($wpsProgIds) }
     }
     foreach ($prog in $order) {
         try {
@@ -236,6 +373,36 @@ function New-OfficeApp($wpsProgIds, $msProgIds) {
     return $null
 }
 
+# Suppress every dialog Office can raise headless. Each assignment is best-effort: property names
+# differ between MS Office and WPS, and a missing one must not abort the run.
+# Notes from the vendor docs: Excel's DisplayAlerts=False makes Confirm-Save-As and compatibility
+# prompts default to Yes; Excel's CheckCompatibility=False skips the compatibility checker entirely;
+# PowerPoint's DisplayAlerts already defaults to ppAlertsNone (1).
+function Set-OfficeAppQuiet($app, $kind) {
+    $pairs = switch ($kind) {
+        "word" {
+            @(
+                @("Visible", $false), @("DisplayAlerts", 0), @("ScreenUpdating", $false),
+                @("AutomationSecurity", 3), @("Options.ConfirmConversions", $false),
+                @("Options.WarnBeforeSavingPrintingSendingMarkup", $false),
+                @("Options.SavePropertiesPrompt", $false), @("Options.UpdateLinksAtOpen", $false)
+            )
+        }
+        "excel" {
+            @(
+                @("Visible", $false), @("DisplayAlerts", $false), @("ScreenUpdating", $false),
+                @("EnableEvents", $false), @("AskToUpdateLinks", $false), @("AutomationSecurity", 3),
+                @("CheckCompatibility", $false)
+            )
+        }
+        "ppt" {
+            @(@("DisplayAlerts", 1), @("Visible", 1))
+        }
+        default { @() }
+    }
+    foreach ($p in $pairs) { try { $app.($p[0]) = $p[1] } catch { } }
+}
+
 function Convert-Word($list) {
     if ($list.Count -eq 0) { return }
     $word = $null
@@ -243,10 +410,7 @@ function Convert-Word($list) {
         $beforeIds = Get-Pids @("wps", "WINWORD")
         $word = New-OfficeApp @("KWPS.Application") @("Word.Application")
         if (-not $word) { throw "No Word automation engine available (WPS or MS Office)." }
-        try { $word.Visible = $false } catch { }
-        try { $word.DisplayAlerts = 0 } catch { }
-        try { $word.AutomationSecurity = 3 } catch { }
-        try { $word.Options.ConfirmConversions = $false } catch { }
+        Set-OfficeAppQuiet $word "word"
         $script:officePid = Get-NewPid @("wps", "WINWORD") $beforeIds
         foreach ($it in $list) {
             $src = $it.src
@@ -285,8 +449,7 @@ function Convert-Excel($list) {
         $beforeIds = Get-Pids @("et", "EXCEL")
         $excel = New-OfficeApp @("KET.Application") @("Excel.Application")
         if (-not $excel) { throw "No Excel automation engine available (WPS or MS Office)." }
-        try { $excel.Visible = $false } catch { }
-        try { $excel.DisplayAlerts = $false } catch { }
+        Set-OfficeAppQuiet $excel "excel"
         $script:officePid = Get-NewPid @("et", "EXCEL") $beforeIds
         foreach ($it in $list) {
             $src = $it.src
@@ -315,6 +478,7 @@ function Convert-Ppt($list) {
         $beforeIds = Get-Pids @("wpp", "POWERPNT")
         $ppt = New-OfficeApp @("KWPP.Application") @("PowerPoint.Application")
         if (-not $ppt) { throw "No PowerPoint automation engine available (WPS or MS Office)." }
+        Set-OfficeAppQuiet $ppt "ppt"
         $script:officePid = Get-NewPid @("wpp", "POWERPNT") $beforeIds
         foreach ($it in $list) {
             $src = $it.src
@@ -396,23 +560,134 @@ function Convert-LibreOffice($list) {
     try { if (Test-Path -LiteralPath $loProfile) { Remove-Item -LiteralPath $loProfile -Recurse -Force -ErrorAction SilentlyContinue } } catch { }
 }
 
-if ($useLibreOffice) {
+# ---------------------------------------------------------------- dispatch
+# Engine priority (auto): MS Office COM -> WPS COM -> LibreOffice.
+# Rationale: LibreOffice re-renders some legacy documents with layout drift (observed: images
+# overflowing the page), while Word/WPS keep the original layout. COM, however, only works from a
+# caller that is BOTH non-elevated AND outside the Hana sandbox, so COM runs in a worker process
+# launched via explorer.exe; anything else falls back to LibreOffice.
+$comTargets = @("docx", "xlsx", "pptx", "pdf")
+$canUseCom = (-not $toFormat) -or ($comTargets -contains $toFormat)
+
+function Write-ResultFile($obj) {
+    if ($ResultFile) { $obj | ConvertTo-Json -Depth 6 -Compress | Set-Content -LiteralPath $ResultFile -Encoding UTF8 }
+}
+
+if ($ComWorker) {
+    # Worker mode: launched unelevated / out of sandbox by the parent. Reports through files only.
+    try {
+        if ($WorkerPidFile) { "$PID" | Set-Content -LiteralPath $WorkerPidFile -Encoding ascii }
+        Write-ProgressJson "worker" 0 $totalItems "com worker pid=$PID" 0
+        $script:comPdf = ($toFormat -eq "pdf")
+        Convert-Word  @($items | Where-Object { $_.type -eq "doc" })
+        Convert-Ppt   @($items | Where-Object { $_.type -eq "ppt" })
+        Convert-Excel @($items | Where-Object { $_.type -eq "xls" })
+        $reportedOut = if ($outDir) { $outDir } else { $srcRoot }
+        Write-ResultFile ([pscustomobject]@{ engine = $script:engineName; input = $inputPath; output = $reportedOut; backupDir = $backupDir; total = $results.Count; results = $results })
+    } catch {
+        Write-ResultFile ([pscustomobject]@{ engine = $script:engineName; error = $_.Exception.ToString(); results = @() })
+    } finally {
+        [System.GC]::Collect(); [System.GC]::WaitForPendingFinalizers()
+        if ($DoneFlag) { "done" | Set-Content -LiteralPath $DoneFlag -Encoding ascii }
+    }
+    exit 0
+}
+
+function Invoke-ComWorker {
+    $tmp = Join-Path $env:TEMP ("ot_com_" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+    $prog = Join-Path $tmp 'progress.txt'
+    $res  = Join-Path $tmp 'result.json'
+    $done = Join-Path $tmp 'done.flag'
+    $pidf = Join-Path $tmp 'worker.pid'
+    $vbs  = Join-Path $tmp 'run.vbs'
+    $self = $PSCommandPath
+    if (-not $self) { $self = $MyInvocation.MyCommand.Path }
+    $cmdLine = "pwsh -NoProfile -ExecutionPolicy Bypass -File `"$self`" -JobFile `"$JobFile`" -ComWorker -ProgressFile `"$prog`" -ResultFile `"$res`" -DoneFlag `"$done`" -WorkerPidFile `"$pidf`""
+    # Two things must hold for Office/WPS COM: the caller is non-elevated AND outside the Hana
+    # sandbox. explorer.exe gives both (it runs at medium integrity, outside the sandbox).
+    # We hand it a .vbs instead of a .cmd precisely because explorer.exe would pop a visible
+    # console for a .cmd; WScript.Shell.Run with window style 0 keeps it silent.
+    $vbsLine = 'CreateObject("WScript.Shell").Run "' + ($cmdLine -replace '"', '""') + '", 0, False'
+    Set-Content -LiteralPath $vbs -Value $vbsLine -Encoding ascii
+    try { Start-Process -FilePath "explorer.exe" -ArgumentList "`"$vbs`"" -WindowStyle Hidden | Out-Null } catch { }
+    $seen = 0
+    $deadline = (Get-Date).AddMinutes(30)
+    $workerPid = 0
+    while (-not (Test-Path -LiteralPath $done)) {
+        if (Test-Path -LiteralPath $prog) {
+            $lines = @(Get-Content -LiteralPath $prog -Encoding UTF8 -ErrorAction SilentlyContinue)
+            for ($i = $seen; $i -lt $lines.Count; $i++) { [Console]::Error.WriteLine([string]$lines[$i]) }
+            $seen = $lines.Count
+        }
+        if (Test-Path -LiteralPath $pidf) { try { $workerPid = [int]((Get-Content -LiteralPath $pidf -Raw).Trim()) } catch { } }
+        if ((Get-Date) -gt $deadline) { break }
+        Start-Sleep -Milliseconds 500
+    }
+    if (Test-Path -LiteralPath $prog) {
+        $lines = @(Get-Content -LiteralPath $prog -Encoding UTF8 -ErrorAction SilentlyContinue)
+        for ($i = $seen; $i -lt $lines.Count; $i++) { [Console]::Error.WriteLine([string]$lines[$i]) }
+    }
+    if (Test-Path -LiteralPath $pidf) { try { $workerPid = [int]((Get-Content -LiteralPath $pidf -Raw).Trim()) } catch { } }
+    if (-not (Test-Path -LiteralPath $res)) {
+        if ($workerPid) { try { & taskkill.exe /PID $workerPid /T /F 2>$null | Out-Null } catch { } }
+        Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        return [pscustomobject]@{ engine = "none"; error = "COM worker did not finish within 30 minutes."; results = @() }
+    }
+    $out = Get-Content -LiteralPath $res -Raw -Encoding UTF8 | ConvertFrom-Json
+    Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    return $out
+}
+
+$forceLo = ($enginePref -eq "libreoffice")
+$wantLo = $forceLo -or (-not $canUseCom)
+
+if ($wantLo) {
+    if (-not $useLibreOffice) {
+        Write-Result ([pscustomobject]@{ engine = "none"; error = ("Target format '" + $toFormat + "' requires LibreOffice, which was not found. Install LibreOffice: https://www.libreoffice.org/download/"); results = @() })
+        exit 0
+    }
     Write-ProgressJson "engine" 0 $totalItems ("using libreoffice: $sofficePath") 0
     Convert-LibreOffice $items
 } else {
-    if ($toFormat) {
-        if ($toFormat -ne "pdf") {
-            Write-Result ([pscustomobject]@{ engine = "none"; error = ("Target format '" + $toFormat + "' requires LibreOffice, which was not found. With only Office/WPS installed, the COM fallback can produce .docx/.xlsx/.pptx and .pdf. Install LibreOffice for the full format matrix: https://www.libreoffice.org/download/"); results = @() })
+    Write-ProgressJson "engine" 0 $totalItems "engine order: ms office -> wps -> libreoffice (unelevated worker)" 0
+    $w = Invoke-ComWorker
+    $okCountW = 0
+    if ($w -and $w.results) { $okCountW = @($w.results | Where-Object { $_.ok }).Count }
+    if ($w -and (-not $w.error) -and ($okCountW -gt 0)) {
+        $script:engineName = if ($w.engine) { [string]$w.engine } else { "ms-office" }
+        # Keep $results an ArrayList: Convert-LibreOffice appends to it, and a plain fixed-size array
+        # would throw "the collection has a fixed size" the moment the per-file fallback kicks in.
+        $results = New-Object System.Collections.ArrayList
+        foreach ($r0 in @($w.results)) { [void]$results.Add($r0) }
+        # Per-file fallback. COM can lose on a single file for reasons that have nothing to do with
+        # the batch: an empty presentation cannot be exported to PDF, a locked part, an odd shape.
+        # Those files are handed to LibreOffice, which is more forgiving. Successes are kept as-is,
+        # and an explicitly forced engine (office/wps) is respected rather than silently retried.
+        $allowFallback = ($useLibreOffice) -and ($enginePref -ne "office") -and ($enginePref -ne "wps")
+        if ($allowFallback) {
+            $failedSrc = @($results | Where-Object { -not $_.ok } | ForEach-Object { [string]$_.src })
+            if ($failedSrc.Count -gt 0) {
+                $retry = @($items | Where-Object { $failedSrc -contains [string]$_.src })
+                if ($retry.Count -gt 0) {
+                    Write-ProgressJson "engine" 0 $totalItems ("com failed on " + $retry.Count + " file(s) -> retry with libreoffice") 0
+                    $kept = New-Object System.Collections.ArrayList
+                    foreach ($r0 in $results) { if ($r0.ok) { [void]$kept.Add($r0) } }
+                    $results = $kept
+                    Convert-LibreOffice $retry
+                    $script:engineName = "mixed"
+                }
+            }
+        }
+    } else {
+        $reason = if ($w -and $w.error) { [string]$w.error } else { "COM produced no successful conversion" }
+        Write-ProgressJson "engine" 0 $totalItems ("com engine unusable -> fallback to libreoffice") 0
+        if (-not $useLibreOffice) {
+            Write-Result ([pscustomobject]@{ engine = "none"; error = ("Office/WPS COM failed and LibreOffice is not installed. COM said: " + $reason); results = @() })
             exit 0
         }
-        $script:comPdf = $true
-    } else {
-        $script:comPdf = $false
+        Convert-LibreOffice $items
     }
-    Write-ProgressJson "engine" 0 $totalItems "using office com (wps/ms)" 0
-    Convert-Word  @($items | Where-Object { $_.type -eq "doc" })
-    Convert-Ppt   @($items | Where-Object { $_.type -eq "ppt" })
-    Convert-Excel @($items | Where-Object { $_.type -eq "xls" })
 }
 [System.GC]::Collect()
 [System.GC]::WaitForPendingFinalizers()

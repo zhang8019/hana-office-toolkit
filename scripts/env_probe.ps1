@@ -62,14 +62,37 @@ $localRoots = @(
     (Join-Under $env:USERPROFILE "AppData\Local")
 ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
 
-# --- officecli (AI-friendly Office CLI) ---
-$officecliCandidates = @($env:OFFICECLI_PATH)
-foreach ($r in $localRoots) { $officecliCandidates += (Join-Under $r "OfficeCli\officecli.exe") }
-foreach ($r in $pfRoots) { $officecliCandidates += (Join-Under $r "OfficeCli\officecli.exe") }
-$officecliCandidates += (Cmd-Path "officecli")
-$officecli = Find-First $officecliCandidates
+# --- Microsoft Office (PRIMARY conversion engine when present; file metadata only, no launch) ---
+$wordCandidates = @()
+foreach ($r in $pfRoots) {
+    $wordCandidates += (Join-Under $r "Microsoft Office\Root\Office16\WINWORD.EXE")
+    $wordCandidates += (Join-Under $r "Microsoft Office\Office16\WINWORD.EXE")
+}
+$word = Find-First $wordCandidates
+$msRegVer = ""
+try { $msRegVer = [string](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration' -ErrorAction SilentlyContinue).VersionToReport } catch { }
 
-# --- LibreOffice (preferred conversion engine) ---
+# --- WPS Office (SECOND conversion engine) ---
+$wps = ""
+$wpsDirVer = ""
+foreach ($r in @($localRoots) + @($pfRoots)) {
+    $base = Join-Under $r "Kingsoft\WPS Office"
+    if (-not $base) { continue }
+    if (Test-Path -LiteralPath $base) {
+        $subs = Get-ChildItem -LiteralPath $base -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending
+        foreach ($s in $subs) {
+            $cand = Join-Path $s.FullName "office6\wps.exe"
+            if (Test-Path -LiteralPath $cand) { $wps = $cand; $wpsDirVer = $s.Name; break }
+        }
+    }
+    if (-not $wps) {
+        $cand2 = Join-Under $base "office6\wps.exe"
+        if ($cand2 -and (Test-Path -LiteralPath $cand2)) { $wps = $cand2 }
+    }
+    if ($wps) { break }
+}
+
+# --- LibreOffice (FALLBACK engine: only it can produce html/csv/txt/rtf/odt/ods/odp/epub/md) ---
 $sofficeCandidates = @($env:SOFFICE_PATH)
 foreach ($r in $pfRoots) { $sofficeCandidates += (Join-Under $r "LibreOffice\program\soffice.exe") }
 foreach ($r in $localRoots) { $sofficeCandidates += (Join-Under $r "LibreOffice\program\soffice.exe") }
@@ -80,16 +103,33 @@ $soffice = Find-First $sofficeCandidates
 $uv = Find-First @((Cmd-Path "uv.exe"), (Cmd-Path "uv"))
 $uvx = Find-First @((Cmd-Path "uvx.exe"), (Cmd-Path "uvx"))
 
-# --- Office COM fallback (WPS or Microsoft Office): registry lookup only, no activation ---
+# --- officecli (bridge for docx/xlsx/pptx read & write) ---
+# OFFICECLI_PATH wins; otherwise the installer's default location under LOCALAPPDATA.
+$officecli = Find-First @($env:OFFICECLI_PATH)
+if (-not $officecli) {
+    $cliCandidates = @()
+    foreach ($r in $localRoots) { $cliCandidates += (Join-Under $r "OfficeCli\officecli.exe") }
+    foreach ($r in $pfRoots) { $cliCandidates += (Join-Under $r "OfficeCli\officecli.exe") }
+    $officecli = Find-First ($cliCandidates + @((Cmd-Path "officecli.exe"), (Cmd-Path "officecli")))
+}
+
+# --- COM registration visibility (registry lookup only, no activation) ---
 function Has-ProgId($progId) {
     try { return ($null -ne [Type]::GetTypeFromProgID($progId, $false)) } catch { return $false }
 }
 $hasWps = (Has-ProgId "KWPS.Application") -or (Has-ProgId "KET.Application")
 $hasMsOffice = (Has-ProgId "Word.Application") -or (Has-ProgId "Excel.Application")
 
+$msVersion = File-Version $word
+if (-not $msVersion) { $msVersion = $msRegVer }
+$wpsVersion = File-Version $wps
+if (-not $wpsVersion) { $wpsVersion = $wpsDirVer }
+
 $result = [pscustomobject]@{
+    officeMs    = [pscustomobject]@{ found = (-not [string]::IsNullOrWhiteSpace($word));   path = [string]$word;   version = $msVersion;  progId = $hasMsOffice }
+    officeWps   = [pscustomobject]@{ found = (-not [string]::IsNullOrWhiteSpace($wps));    path = [string]$wps;    version = $wpsVersion; progId = $hasWps }
+    libreoffice = [pscustomobject]@{ found = (-not [string]::IsNullOrWhiteSpace($soffice)); path = [string]$soffice; version = (File-Version $soffice) }
     officecli   = [pscustomobject]@{ found = (-not [string]::IsNullOrWhiteSpace($officecli)); path = [string]$officecli; version = (File-Version $officecli) }
-    libreoffice = [pscustomobject]@{ found = (-not [string]::IsNullOrWhiteSpace($soffice));   path = [string]$soffice;   version = (File-Version $soffice) }
     uv          = [pscustomobject]@{ found = (-not [string]::IsNullOrWhiteSpace($uv));        path = [string]$uv }
     uvx         = [pscustomobject]@{ found = (-not [string]::IsNullOrWhiteSpace($uvx));       path = [string]$uvx }
     officeCom   = [pscustomobject]@{ wps = $hasWps; ms = $hasMsOffice }

@@ -1,7 +1,7 @@
 // Office 工具箱面板：状态 / 异步旧文档转换 / officecli 命令。
 import { hana } from "./sdk.js";
 
-const ROUTE = { status: "/status", run: "/run", convert: "/convert", jobs: "/jobs", deps: "/deps" };
+const ROUTE = { status: "/status", run: "/run", convert: "/convert", jobs: "/jobs", deps: "/deps", cleanup: "/cleanup" };
 const ACTIVE = new Set(["queued", "running", "cancelling"]);
 const ui = {
   root: document.getElementById("panel"), startup: document.getElementById("startup"),
@@ -13,6 +13,7 @@ const ui = {
   cvRun: document.getElementById("cv-run"), cvResult: document.getElementById("cv-result"),
   cvJobs: document.getElementById("cv-jobs"), cvConfirm: document.getElementById("cv-confirm"),
   depsList: document.getElementById("deps-list"), depsRefresh: document.getElementById("deps-refresh"),
+  depsCleanup: document.getElementById("deps-cleanup"), depsNote: document.getElementById("deps-note"),
   secDeps: document.getElementById("sec-deps"),
   cvConfirmNo: document.getElementById("cv-confirm-no"), cvConfirmYes: document.getElementById("cv-confirm-yes"),
   runArgs: document.getElementById("run-args"),
@@ -41,10 +42,10 @@ async function refreshDeps() {
     if (status !== 200 || !data?.ok) throw new Error(data?.error || `HTTP ${status}`);
     const d = data.deps || {};
     const rows = [
-      ["LibreOffice", !!d.libreoffice?.found, d.libreoffice?.found ? `${d.libreoffice.version || "版本未知"} · ${d.libreoffice.path}` : "未安装（转换引擎）"],
+      ["MS Office / WPS", !!(d.officeCom?.ms || d.officeCom?.wps), [d.officeCom?.ms ? "MS Office" : "", d.officeCom?.wps ? "WPS" : ""].filter(Boolean).join(" + ") || "未检测到（首选引擎：旧格式→现代格式、导出 PDF）"],
+      ["LibreOffice", !!d.libreoffice?.found, d.libreoffice?.found ? `${d.libreoffice.version || "版本未知"} · ${d.libreoffice.path}` : "未安装（回落引擎：html/csv/txt/rtf/odt/ods/epub 等只有它能做）"],
       ["officecli", !!d.officecli?.found, d.officecli?.found ? `${d.officecli.version || "版本未知"} · ${d.officecli.path}` : "未安装（docx/xlsx/pptx 读写）"],
       ["uv / uvx", !!(d.uv?.found || d.uvx?.found), (d.uvx?.path || d.uv?.path) || "未安装（文档 MCP）"],
-      ["Office COM", !!(d.officeCom?.wps || d.officeCom?.ms), [d.officeCom?.wps ? "WPS" : "", d.officeCom?.ms ? "MS Office" : ""].filter(Boolean).join(" + ") || "未检测到（兜底引擎）"],
     ];
     ui.depsList.replaceChildren(...rows.map(([name, ok, detail]) => {
       const row = document.createElement("div");
@@ -157,8 +158,20 @@ async function doRun() {
   finally { ui.runGo.disabled = false; }
 }
 
+async function doCleanup() {
+  ui.depsCleanup.disabled = true; setResult(ui.depsNote, "清理中…", null);
+  try {
+    const { status, data } = await post(ROUTE.cleanup, {});
+    if (status !== 200 || !data?.ok) throw new Error(data?.error || `HTTP ${status}`);
+    setResult(ui.depsNote, `已清理：临时目录${data.swept ? "已扫" : "跳过"}；子进程 ${data.killed} 个；无窗口残留 Office/soffice ${data.zombies} 个。`, "ok");
+    stamp();
+  } catch (err) { setResult(ui.depsNote, `清理失败：${err?.message || err}`, "err"); }
+  finally { ui.depsCleanup.disabled = false; }
+}
+
 ui.refresh.addEventListener("click", async () => { await refreshStatus(); await refreshDeps(); await refreshJobs(); });
 ui.depsRefresh.addEventListener("click", refreshDeps);
+ui.depsCleanup.addEventListener("click", doCleanup);
 ui.cvRun.addEventListener("click", doConvert);
 ui.cvConfirmNo.addEventListener("click", () => { ui.cvConfirm.hidden = true; });
 ui.cvConfirmYes.addEventListener("click", () => submitConversion(true));

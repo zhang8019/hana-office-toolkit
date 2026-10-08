@@ -23,9 +23,12 @@ import {
 
 export const name = "office-toolkit";
 
-const VERSION = "0.7.0";
+const VERSION = "0.8.0";
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const CONVERT_SCRIPT = path.join(SCRIPT_DIR, "scripts", "office_convert.ps1");
+// Accepted values for the `to` / `engine` options (keep in sync with the tool schema).
+const ALLOWED_TARGETS = ["pdf", "docx", "doc", "xlsx", "xls", "pptx", "ppt", "html", "txt", "csv", "rtf", "odt", "ods", "odp", "epub", "md"];
+const ALLOWED_ENGINES = ["auto", "office", "wps", "libreoffice"];
 const ENV_PROBE = path.join(SCRIPT_DIR, "scripts", "env_probe.ps1");
 const INSTALL_OFFICECLI = path.join(SCRIPT_DIR, "scripts", "install_officecli.ps1");
 
@@ -140,7 +143,7 @@ export default defineApp(async (sdk) => {
   const nowIso = () => new Date().toISOString();
 
   function publicJob(job) {
-    const { child, timer, stallTimer, stdout, stderr, pid, cancelReason, ...visible } = job;
+    const { child, timer, stallTimer, stdout, stderr, pid, cancelReason, procsBefore, ...visible } = job;
     return { ...visible, updatedAt: job.updatedAt };
   }
   function saveJob(job) {
@@ -225,7 +228,7 @@ export default defineApp(async (sdk) => {
       if (job.status !== "running") return;
       job.cancelReason = "stalled"; job.status = "cancelling";
       job.phase = "当前文件超过 15 分钟没有进度，正在终止子进程树";
-      saveJob(job); killProcessTree(job.child); killPid(job.officePid);
+      saveJob(job); killProcessTree(job.child); killPid(job.officePid); killPid(job.workerPid);
     }, TIMEOUT.stalledFile);
   }
 
@@ -254,17 +257,57 @@ export default defineApp(async (sdk) => {
         try { job.currentFile = Buffer.from(String(p.fileB64), "base64").toString("utf8"); } catch {}
       }
       if (Number.isFinite(p.officePid) && p.officePid > 0) job.officePid = p.officePid;
+      if (Number.isFinite(p.workerPid) && p.workerPid > 0) job.workerPid = p.workerPid;
       saveJob(job);
     } catch { /* 忽略格式异常，不影响转换 */ }
+  }
+
+  // A wedged job must not block the queue forever: if the running job has had no progress for a
+  // while, cancel it and let the new one through (previously the user had to cancel by hand).
+  const STALE_JOB_MS = 5 * 60_000;
+  async function clearStalledJob() {
+    const active = [...jobs.values()].filter((j) => ["running", "queued", "cancelling"].includes(j.status));
+    if (active.length === 0) return null;
+    const running = active.find((j) => j.status === "running");
+    if (!running) return active[0];
+    const idleMs = Date.now() - Date.parse(running.updatedAt || running.createdAt);
+    if (idleMs <= STALE_JOB_MS) return running;
+    sdk.logger.warn(`office-toolkit: job ${running.jobId} idle ${Math.round(idleMs / 1000)}s, auto-cancelling to unblock the queue`);
+    await cancelConversion(running.jobId);
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      if (!["running", "queued", "cancelling"].includes(running.status)) break;
+    }
+    return ["running", "queued", "cancelling"].includes(running.status) ? running : null;
+  }
+
+  // Settings declared in manifest contributes.settings act as defaults when a call omits the value.
+  async function readConfigDefaults() {
+    const pick = async (key) => { try { const v = await sdk.config.get(key); return v; } catch { return undefined; } };
+    return { engine: await pick("engine"), to: await pick("targetFormat"), mode: await pick("mode") };
   }
 
   async function startConversion({ input, output, mode, recursive, confirmReplace, to, engine }) {
     const src = String(input || "").trim();
     if (!src) return { error: "缺少 input（待转换的文件或目录路径）。" };
-    if (mode === "replace" && confirmReplace !== true) return { error: "replace 会删除源文件，必须先明确确认。确认后再传 confirmReplace=true。" };
-    const alreadyRunning = [...jobs.values()].find((j) => ["running", "queued", "cancelling"].includes(j.status));
-    if (alreadyRunning) return { error: `已有转换任务在运行（${alreadyRunning.jobId}），先等待或取消它。` };
-    const m = ["keep", "backup", "replace"].includes(mode) ? mode : "keep";
+    const cfg = await readConfigDefaults();
+    const effMode = (mode && String(mode)) || (cfg.mode && String(cfg.mode)) || "keep";
+    const effTo = (to && String(to)) || (cfg.to && String(cfg.to)) || "";
+    const effEngine = (engine && String(engine)) || (cfg.engine && String(cfg.engine)) || "auto";
+    // Reject nonsense at submit time. A bad `to` used to sail through and stall a job mid-flight,
+    // and since only one job runs at a time that wedged every later request.
+    const normTo = effTo ? String(effTo).replace(/^\./, "").toLowerCase() : "";
+    const normEngine = String(effEngine).toLowerCase();
+    if (normTo && !ALLOWED_TARGETS.includes(normTo)) {
+      return { error: `不支持的目标格式“${effTo}”。可选：${ALLOWED_TARGETS.join("、")}。` };
+    }
+    if (!ALLOWED_ENGINES.includes(normEngine)) {
+      return { error: `不支持的引擎“${effEngine}”。可选：${ALLOWED_ENGINES.join("、")}。` };
+    }
+    if (effMode === "replace" && confirmReplace !== true) return { error: "replace 会删除源文件，必须先明确确认。确认后再传 confirmReplace=true。" };
+    const blocker = await clearStalledJob();
+    if (blocker) return { error: `已有转换任务在运行（${blocker.jobId}），先等待或取消它。` };
+    const m = ["keep", "backup", "replace"].includes(effMode) ? effMode : "keep";
     ensureWorkDir();
     cleanupOldJobs();
     const jobId = randomUUID();
@@ -276,7 +319,7 @@ export default defineApp(async (sdk) => {
       backupDir: "", input: src, createdAt: nowIso(), updatedAt: nowIso(), finishedAt: null,
     };
     jobs.set(jobId, job);
-    fs.writeFileSync(inFile, JSON.stringify({ input: src, output: job.outDir, mode: m, recursive: recursive !== false, keepTimestamps: true, to: to ? String(to).replace(/^\./, "").toLowerCase() : "", engine: engine ? String(engine) : "auto" }), "utf8");
+    fs.writeFileSync(inFile, JSON.stringify({ input: src, output: job.outDir, mode: m, recursive: recursive !== false, keepTimestamps: true, to: normTo, engine: normEngine }), "utf8");
     saveJob(job);
 
     let pwsh;
@@ -287,6 +330,10 @@ export default defineApp(async (sdk) => {
       return { error: job.error };
     }
     if (terminal.has(job.status)) return { jobId, status: job.status, message: "任务在启动阶段已被取消。" };
+    // Before-use cleanup: clear headless leftovers so a stale instance cannot wedge this run.
+    const preCleaned = await killHeadlessOfficeProcs();
+    if (preCleaned > 0) sdk.logger.info(`office-toolkit: pre-run cleanup removed ${preCleaned} leftover Office process(es)`);
+    job.procsBefore = (await listOfficeProcs()).map((p) => p.pid);
     let child;
     try {
       child = spawn(pwsh, ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", CONVERT_SCRIPT, "-JobFile", inFile], { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
@@ -322,7 +369,7 @@ export default defineApp(async (sdk) => {
     job.timer = setTimeout(() => {
       if (terminal.has(job.status)) return;
       job.cancelReason = "timeout"; job.status = "cancelling"; job.phase = "转换超过 60 分钟，正在终止子进程树";
-      saveJob(job); killProcessTree(child); killPid(job.officePid);
+      saveJob(job); killProcessTree(child); killPid(job.officePid); killPid(job.workerPid);
     }, TIMEOUT.convert);
     child.on("close", (code, signal) => {
       clearTimeout(job.timer);
@@ -359,8 +406,13 @@ export default defineApp(async (sdk) => {
         job.status = "completed"; job.phase = "转换完成";
       }
       job.finishedAt = nowIso(); saveJob(job);
-      if (job.status !== "completed") killPid(job.officePid);
+      if (job.status !== "completed") { killPid(job.officePid); killPid(job.workerPid); }
       try { fs.unlinkSync(inFile); } catch {}
+      void sweepTemp();
+      // Kill whatever Office/soffice processes this job spawned, then sweep headless leftovers too.
+      void killJobSpawnedProcs(job)
+        .then((n) => killHeadlessOfficeProcs().then((m) => { const total = n + m; if (total > 0) sdk.logger.info(`office-toolkit: post-run cleanup removed ${total} Office process(es) from job ${job.jobId}`); }))
+        .catch(() => {});
     });
     return { jobId, status: job.status, message: "转换任务已启动。使用 office_convert_status 查询进度，或 office_convert_cancel 取消。" };
   }
@@ -379,6 +431,7 @@ export default defineApp(async (sdk) => {
     job.cancelReason = "user"; job.status = "cancelling"; job.phase = "正在取消并清理子进程树"; saveJob(job);
     killProcessTree(child);
     killPid(job.officePid);
+    killPid(job.workerPid);
     return { jobId: job.jobId, status: "cancelling", message: "已请求取消；稍后查询状态确认进程已退出。" };
   }
 
@@ -388,13 +441,37 @@ export default defineApp(async (sdk) => {
   // Other people install this App from the marketplace on machines that may have none of the
   // pieces we lean on. Report exactly what is missing and what to run, instead of failing late.
   const DEP_GUIDE = {
+    officeMs: {
+      label: "MS Office（Word / Excel / PowerPoint）",
+      why: "首选转换引擎：旧格式→现代格式、导出 PDF，能保住原件版式",
+      required: "转换（首选）",
+      how: "",
+      winget: "",
+      url: "https://www.microsoft.com/microsoft-365/buy/compare-all-microsoft-365-products",
+    },
+    officeWps: {
+      label: "WPS Office",
+      why: "第二顺位转换引擎，能力同 MS Office",
+      required: "转换（次选）",
+      how: "",
+      winget: "",
+      url: "https://www.wps.com/download/",
+    },
     libreoffice: {
       label: "LibreOffice",
-      why: "转换引擎：旧格式现代化、转 PDF/HTML/CSV 等都靠它",
-      required: "文档转换相关工具",
+      why: "回落引擎：html / csv / txt / rtf / odt / ods / odp / epub / md 只有它能输出",
+      required: "额外目标格式",
       how: "winget",
       winget: "TheDocumentFoundation.LibreOffice",
       url: "https://www.libreoffice.org/download/download-libreoffice/",
+    },
+    officecli: {
+      label: "officecli",
+      why: "docx/xlsx/pptx 的读写桥接（只认新版 DrawingML，看不见老式 VML 浮动图）",
+      required: "office_cli_run / office_cli_status",
+      how: "download",
+      winget: "",
+      url: "https://github.com/iOfficeAI/OfficeCLI",
     },
     uv: {
       label: "uv / uvx",
@@ -404,22 +481,80 @@ export default defineApp(async (sdk) => {
       winget: "astral-sh.uv",
       url: "https://docs.astral.sh/uv/getting-started/installation/",
     },
-    officecli: {
-      label: "officecli",
-      why: "docx/xlsx/pptx 的读写桥接",
-      required: "office_cli_run / office_cli_status",
-      how: "download",
-      winget: "",
-      url: "https://github.com/iOfficeAI/OfficeCLI",
-    },
-    officeCom: {
-      label: "Office COM（WPS 或 MS Office）",
-      why: "没有 LibreOffice 时的转换兜底（仅旧格式→现代格式）",
-      required: "可选兜底",
-      winget: "",
-      url: "https://www.libreoffice.org/download/download-libreoffice/",
-    },
   };
+
+  // Housekeeping: the conversion script cleans the transient %TEMP% dirs it creates. Called on
+  // load and after every finished job so repeated runs do not accumulate junk.
+  async function sweepTemp() {
+    try {
+      const pwsh = await resolvePwsh();
+      const r = await run(pwsh, ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", CONVERT_SCRIPT, "-SweepTemp"], { timeoutMs: 60_000 });
+      return r.ok;
+    } catch { return false; }
+  }
+
+  // Zombie-process control. Office/WPS automation leaks instances (Microsoft documents this for
+  // server-side automation: once instances leak, later calls hang). We snapshot the Office/soffice
+  // processes before a job and kill only the ones that appeared during it, so a user's own open
+  // Word/Excel is never touched.
+  async function listOfficeProcs() {
+    try {
+      const pwsh = await resolvePwsh();
+      const r = await run(pwsh, ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", CONVERT_SCRIPT, "-ListOfficePids"], { timeoutMs: 60_000 });
+      if (!r.ok) return [];
+      const txt = String(r.stdout).replace(/^\uFEFF/, "").trim();
+      if (!txt) return [];
+      const parsed = JSON.parse(txt.split(/\r?\n/).at(-1));
+      // Defensive: PowerShell can hand back a nested array for a single result; flatten and drop junk.
+      const flat = Array.isArray(parsed) ? parsed.flat(Infinity) : [parsed];
+      return flat.filter((p) => p && typeof p === "object" && Number(p.pid) > 0);
+    } catch { return []; }
+  }
+
+  async function killJobSpawnedProcs(job) {
+    const before = new Set(job.procsBefore || []);
+    const after = await listOfficeProcs();
+    let n = 0;
+    for (const p of after) {
+      if (before.has(p.pid)) continue;
+      killPid(p.pid);
+      n++;
+    }
+    return n;
+  }
+
+  // A headless Office/soffice process (no window title) is always an automation leftover: anything
+  // the user has open themselves shows a title. Used both before and after a job, so leftovers from
+  // an earlier crash cannot wedge the next run.
+  async function killHeadlessOfficeProcs() {
+    const procs = await listOfficeProcs();
+    let n = 0;
+    for (const p of procs) {
+      if (String(p.title || "").trim()) continue;
+      killPid(p.pid);
+      n++;
+    }
+    return n;
+  }
+
+  // One cleanup routine behind both the tool and the panel button: temp dirs + recorded child
+  // processes + headless Office/soffice zombies.
+  async function runCleanup() {
+    const swept = await sweepTemp();
+    const cutoff = Date.now() - 60 * 60_000;
+    let killed = 0;
+    for (const job of jobs.values()) {
+      if (!terminal.has(job.status)) continue;
+      if (Date.parse(job.finishedAt || job.updatedAt || job.createdAt) < cutoff) continue;
+      // Recorded PIDs from finished jobs; most have already exited, so this counts attempts rather
+      // than confirmed kills. The meaningful figure is `zombies` (headless leftovers actually found).
+      killed += [job.officePid, job.workerPid].filter((p) => Number.isInteger(Number(p)) && Number(p) > 0).length;
+      killPid(job.officePid);
+      killPid(job.workerPid);
+    }
+    const zombies = await killHeadlessOfficeProcs();
+    return { swept, killed, zombies };
+  }
 
   async function probeDeps() {
     const pwsh = await resolvePwsh();
@@ -431,39 +566,70 @@ export default defineApp(async (sdk) => {
 
   function renderDeps(deps) {
     const lines = [];
-    const missing = [];
-    const add = (key, ok, detail) => {
+    const installable = [];
+    const detail = (o) => (o?.found ? `${o.version || "版本未知"}${o.path ? ` · ${o.path}` : ""}` : "未检测到");
+    const row = (key, found, text) => {
       const g = DEP_GUIDE[key];
-      lines.push(`${ok ? "✓" : "✗"} ${g.label}${detail ? ` — ${detail}` : ""}`);
-      if (!ok) missing.push(key);
+      lines.push(`${found ? "✓" : "✗"} ${g.label} — ${text}`);
+      if (!found && g.how) installable.push(key);
     };
-    add("libreoffice", !!deps.libreoffice?.found, deps.libreoffice?.found ? `${deps.libreoffice.version || "版本未知"}${deps.libreoffice.path ? ` · ${deps.libreoffice.path}` : ""}` : "未找到");
-    add("officecli", !!deps.officecli?.found, deps.officecli?.found ? `${deps.officecli.version || "版本未知"}${deps.officecli.path ? ` · ${deps.officecli.path}` : ""}` : "未找到");
+    const ms = deps.officeMs || {};
+    const wps = deps.officeWps || {};
+    const lo = deps.libreoffice || {};
+    row("officeMs", !!ms.found, detail(ms));
+    row("officeWps", !!wps.found, detail(wps));
+    row("libreoffice", !!lo.found, detail(lo));
+    row("officecli", !!deps.officecli?.found, detail(deps.officecli));
     const hasUv = !!(deps.uv?.found || deps.uvx?.found);
-    add("uv", hasUv, hasUv ? (deps.uvx?.path || deps.uv?.path) : "未找到");
-    const com = deps.officeCom || {};
-    lines.push(`${(com.wps || com.ms) ? "✓" : "✗"} ${DEP_GUIDE.officeCom.label} — ${com.wps ? "WPS " : ""}${com.ms ? "MS Office" : ""}${(com.wps || com.ms) ? "" : "未检测到"}`);
+    row("uv", hasUv, hasUv ? (deps.uvx?.path || deps.uv?.path) : "未检测到");
 
-    if (missing.length) {
-      lines.push("", "缺的东西与装法：");
-      for (const key of missing) {
+    lines.push("");
+    if (ms.found || wps.found) {
+      lines.push("转换：可用（旧格式→现代格式、导出 PDF；引擎顺序 MS Office → WPS → LibreOffice）。");
+      if (lo.found) lines.push("额外目标格式（html / csv / txt / rtf / odt / ods / odp / epub / md）由 LibreOffice 提供。");
+    } else if (lo.found) {
+      lines.push("转换：仅 LibreOffice。能转，但某些老文档版式可能失真（如图片溢出页外）。建议装 MS Office 或 WPS 以提升保真度。");
+    } else {
+      lines.push("转换：不可用。需要 MS Office / WPS 之一，或安装 LibreOffice。");
+    }
+
+    const manual = [];
+    if (!ms.found) manual.push("officeMs");
+    if (!wps.found) manual.push("officeWps");
+    if (manual.length) {
+      lines.push("", "以下为商业软件，本 App 不代装：");
+      for (const key of manual) lines.push(`• ${DEP_GUIDE[key].label}：${DEP_GUIDE[key].url}`);
+    }
+    if (installable.length) {
+      lines.push("", "可自动安装的缺失项：");
+      for (const key of installable) {
         const g = DEP_GUIDE[key];
         lines.push(`• ${g.label}（${g.required}）：${g.why}`);
-        if (g.how) lines.push(`  自动：office_deps_install(target="${key}", confirm=true)`);
+        lines.push(`  自动：office_deps_install(target="${key}", confirm=true)`);
         lines.push(`  手动：${g.url}`);
       }
-    } else {
-      lines.push("", "依赖齐了，所有功能可用。");
     }
-    return { text: lines.join("\n"), missing: missing.map((k) => DEP_GUIDE[k].label) };
+    return { text: lines.join("\n"), missing: installable.map((k) => DEP_GUIDE[k].label) };
   }
 
   // ---------------------------------------------------------------- 工具
 
   await sdk.tools.register({
+    name: "office_cleanup",
+    description:
+      "清理本 App 留下的临时文件与僵尸进程。① 清扫 %TEMP% 下过期的运行目录（仅删一小时前的）；② 按任务记录结束已结束任务遗留的子进程；③ 清掉**无窗口标题**的 Office/soffice 进程——这类是自动化残留，你自己打开着的 Word/Excel 有窗口标题，不会被动。任务收尾时也会自动清；此工具用于手动兜底。confirm 必须显式传 true。",
+    parameters: { type: "object", properties: { confirm: { type: "boolean", description: "必须显式传 true 才会执行。" } } },
+    execute: async ({ confirm }) => {
+      if (confirm !== true) return fail("将清扫临时目录，并按记录结束已结束任务遗留的子进程（仅限提前一小时内结束的任务，降低 PID 重用误杀风险）。同意后传 confirm=true 重试。");
+      const r = await runCleanup();
+      return text(`清理完成：临时目录清扫${r.swept ? "已执行" : "跳过（脚本不可用）"}；按记录复核了 ${r.killed} 个历史子进程 PID（多数已自行退出）；实际清掉无窗口的僵尸 Office/soffice 进程 ${r.zombies} 个。`);
+    },
+  });
+
+  await sdk.tools.register({
     name: "office_deps_status",
     description:
-      "检查本机文档工具链依赖：LibreOffice（转换引擎）、officecli（docx/xlsx/pptx 桥接）、uv/uvx（运行随包托管的 timeverse-office-doc MCP）、Office COM（WPS/MS Office 兜底）。返回每项是否就绪、路径/版本，以及缺失项的安装方式。首次使用或功能报「未找到」时先跑它。无需参数。",
+      "检查本机文档工具链依赖（按引擎优先级排序）：MS Office（首选转换引擎）、WPS Office（次选）、LibreOffice（回落引擎，负责 html/csv/txt 等额外目标格式）、officecli（docx/xlsx/pptx 读写桥接）、uv/uvx（运行随包托管的 timeverse-office-doc MCP）。返回每项是否就绪、路径/版本，以及转换当前是否可用、缺失项怎么装。首次使用或功能报错时先跑它。无需参数。",
     parameters: { type: "object", properties: {} },
     execute: async () => {
       const deps = await probeDeps();
@@ -571,7 +737,7 @@ export default defineApp(async (sdk) => {
   await sdk.tools.register({
     name: "office_convert",
     description:
-      "启动文档转换并立即返回 jobId。缺省把旧格式转现代格式（.doc/.rtf→.docx、.xls→.xlsx、.ppt→.pptx）；传 to 可转成指定格式（pdf、docx、doc、xlsx、xls、pptx、ppt、html、txt、csv、rtf、odt、ods、odp、epub、md），此时会转换输入内所有可识别文档。转 PDF 等能力由本机 LibreOffice 提供（officecli 做不到）。使用 office_convert_status 查询进度/结果，office_convert_cancel 取消。mode=keep|backup|replace（replace 删除源文件，须先向用户确认）。",
+      "启动文档转换并立即返回 jobId。引擎自动顺序为 MS Office → WPS → LibreOffice（Word/WPS 能保住原件版式，LibreOffice 在某些老文档上会重排失真；COM 引擎由 explorer 派生的非提升子进程执行，失败自动回落 LibreOffice）。缺省把旧格式转现代格式（.doc/.rtf→.docx、.xls→.xlsx、.ppt→.pptx）；传 to 可转成指定格式（pdf、docx、doc、xlsx、xls、pptx、ppt、html、txt、csv、rtf、odt、ods、odp、epub、md）。目标是 pdf 时走 Word/WPS 导出，html/csv/txt 等仅 LibreOffice 能做。结果里会报出实际使用的引擎。使用 office_convert_status 查询进度/结果，office_convert_cancel 取消。mode=keep|backup|replace（replace 删除源文件，须先向用户确认）。",
     parameters: {
       type: "object",
       properties: {
@@ -581,7 +747,7 @@ export default defineApp(async (sdk) => {
         recursive: { type: "boolean", description: "目录输入时是否递归，默认 true。" },
         confirmReplace: { type: "boolean", description: "仅 mode=replace 时必填 true；先向用户说明源文件会删除并取得明确同意。" },
         to: { type: "string", description: "可选目标格式。缺省时按旧格式默认映射（doc/rtf→docx、xls→xlsx、ppt→pptx）。指定后转换输入目录内所有可识别文档，支持：pdf、docx、doc、xlsx、xls、pptx、ppt、html、txt、csv、rtf、odt、ods、odp、epub、md。转 PDF 需本机 LibreOffice。" },
-        engine: { type: "string", enum: ["auto", "libreoffice", "wps", "office"], description: "可选引擎，默认 auto（LibreOffice 优先）。" },
+        engine: { type: "string", enum: ["auto", "office", "wps", "libreoffice"], description: "可选引擎，默认 auto（MS Office → WPS → LibreOffice）。" },
       },
       required: ["input"],
     },
@@ -637,6 +803,13 @@ export default defineApp(async (sdk) => {
       return c.json({ ok: true, deps, missing: rendered.missing });
     });
 
+    app.post("/cleanup", async (c) => {
+      // Panel button: same routine as the office_cleanup tool. Clicking the button is the explicit
+      // confirmation, so no extra confirm flag is needed on this path.
+      const r = await runCleanup();
+      return c.json({ ok: true, ...r });
+    });
+
     app.get("/jobs", (c) => c.json({ ok: true, jobs: listJobs().slice(0, 20) }));
 
     app.get("/jobs/:jobId", (c) => {
@@ -671,6 +844,9 @@ export default defineApp(async (sdk) => {
     await sdk.logger.warn(`office-toolkit dependency probe error: ${error?.message ?? error}`);
   }
 
+  // Best-effort sweep on load so a previous session's leftovers do not pile up.
+  void sweepTemp();
+
   await sdk.logger.info(`office-toolkit ${VERSION} ready: tools=office_deps_status/office_deps_install/office_cli_status/office_cli_run/office_convert/office_convert_status/office_convert_cancel, routes=status/deps/run/convert/jobs`);
 });
 
@@ -682,4 +858,5 @@ function text(s) {
 function fail(message, hint) {
   return { content: [{ type: "text", text: hint ? `${message}\n\n提示：${hint}` : String(message) }], isError: true };
 }
+
 
