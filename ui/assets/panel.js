@@ -163,7 +163,7 @@ async function doCleanup() {
   try {
     const { status, data } = await post(ROUTE.cleanup, {});
     if (status !== 200 || !data?.ok) throw new Error(data?.error || `HTTP ${status}`);
-    setResult(ui.depsNote, `已清理：临时目录${data.swept ? "已扫" : "跳过"}；子进程 ${data.killed} 个；无窗口残留 Office/soffice ${data.zombies} 个。`, "ok");
+    setResult(ui.depsNote, `已清理：临时目录${data.swept ? "已扫" : "跳过"}；子进程 ${data.killed} 个；无窗口进程 ${(data.candidates || []).length} 个（仅报告，未结束）。`, "ok");
     stamp();
   } catch (err) { setResult(ui.depsNote, `清理失败：${err?.message || err}`, "err"); }
   finally { ui.depsCleanup.disabled = false; }

@@ -23,9 +23,11 @@ import {
 
 export const name = "office-toolkit";
 
-const VERSION = "0.8.0";
+const VERSION = "0.9.0";
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const CONVERT_SCRIPT = path.join(SCRIPT_DIR, "scripts", "office_convert.ps1");
+const COMPOSE_CAPTION = path.join(SCRIPT_DIR, "scripts", "compose_caption.ps1");
+const INSERT_ROWS = path.join(SCRIPT_DIR, "scripts", "docx_insert_rows.ps1");
 // Accepted values for the `to` / `engine` options (keep in sync with the tool schema).
 const ALLOWED_TARGETS = ["pdf", "docx", "doc", "xlsx", "xls", "pptx", "ppt", "html", "txt", "csv", "rtf", "odt", "ods", "odp", "epub", "md"];
 const ALLOWED_ENGINES = ["auto", "office", "wps", "libreoffice"];
@@ -122,15 +124,28 @@ export default defineApp(async (sdk) => {
   async function resolvePwsh() {
     const env = process.env;
     const prefs = [];
-    if (env.ProgramFiles) prefs.push(`${env.ProgramFiles}\\PowerShell\\7\\pwsh.exe`);
-    if (env.LOCALAPPDATA) prefs.push(`${env.LOCALAPPDATA}\\Microsoft\\WindowsApps\\pwsh.exe`);
-    prefs.push("pwsh", "powershell.exe");
+    for (const base of [env.ProgramFiles, env.ProgramW6432, "C:\\Program Files"]) {
+      if (base) prefs.push(`${base}\\PowerShell\\7\\pwsh.exe`);
+    }
+    for (const base of [env.LOCALAPPDATA, env.USERPROFILE ? `${env.USERPROFILE}\\AppData\\Local` : ""]) {
+      if (base) prefs.push(`${base}\\Microsoft\\WindowsApps\\pwsh.exe`);
+    }
+    prefs.push("pwsh");
     for (const c of prefs) {
       try {
         const info = await sdk.process.resolveExecutable({ candidates: [c] });
         if (info?.path) return info.path;
       } catch { /* 继续下一个 */ }
     }
+    // resolveExecutable can reject the WindowsApps app-exec alias, which is the usual way pwsh is
+    // installed on Windows. Verify the bare name by actually running it before giving up: falling
+    // through to 5.1 silently changes quoting and encoding behaviour for the whole pipeline.
+    const probe = await run("pwsh", ["-NoProfile", "-NonInteractive", "-Command", "$PSVersionTable.PSVersion.Major"], { timeoutMs: 10_000 });
+    if (probe.ok && String(probe.stdout || "").trim().startsWith("7")) {
+      await sdk.logger.info("office-toolkit: using pwsh (resolved by probe)");
+      return "pwsh";
+    }
+    await sdk.logger.warn("office-toolkit: pwsh not found, falling back to Windows PowerShell 5.1");
     return "powershell.exe";
   }
 
@@ -315,7 +330,7 @@ export default defineApp(async (sdk) => {
     const job = {
       jobId, status: "queued", phase: "准备启动 PowerShell", percent: 0,
       current: 0, total: null, currentFile: null, error: null, results: null,
-      okCount: 0, failCount: 0, mode: m, outDir: output ? String(output) : "",
+      okCount: 0, skippedCount: 0, failCount: 0, mode: m, outDir: output ? String(output) : "",
       backupDir: "", input: src, createdAt: nowIso(), updatedAt: nowIso(), finishedAt: null,
     };
     jobs.set(jobId, job);
@@ -330,9 +345,7 @@ export default defineApp(async (sdk) => {
       return { error: job.error };
     }
     if (terminal.has(job.status)) return { jobId, status: job.status, message: "任务在启动阶段已被取消。" };
-    // Before-use cleanup: clear headless leftovers so a stale instance cannot wedge this run.
-    const preCleaned = await killHeadlessOfficeProcs();
-    if (preCleaned > 0) sdk.logger.info(`office-toolkit: pre-run cleanup removed ${preCleaned} leftover Office process(es)`);
+    // Take a snapshot ONLY. Do not kill anything here: see listHeadlessOfficeProcs above.
     job.procsBefore = (await listOfficeProcs()).map((p) => p.pid);
     let child;
     try {
@@ -399,7 +412,8 @@ export default defineApp(async (sdk) => {
       } else {
         job.results = parsed.results || [];
         job.okCount = job.results.filter((x) => x.ok).length;
-        job.failCount = job.results.length - job.okCount;
+        job.skippedCount = job.results.filter((x) => x.skipped).length;
+        job.failCount = job.results.length - job.okCount - job.skippedCount;
         job.total = parsed.total ?? job.results.length;
         job.percent = 100; job.outDir = parsed.output || job.outDir;
         job.backupDir = parsed.backupDir || "";
@@ -409,9 +423,9 @@ export default defineApp(async (sdk) => {
       if (job.status !== "completed") { killPid(job.officePid); killPid(job.workerPid); }
       try { fs.unlinkSync(inFile); } catch {}
       void sweepTemp();
-      // Kill whatever Office/soffice processes this job spawned, then sweep headless leftovers too.
+      // Kill only the processes THIS job spawned (snapshot difference). Nothing is killed by guesswork.
       void killJobSpawnedProcs(job)
-        .then((n) => killHeadlessOfficeProcs().then((m) => { const total = n + m; if (total > 0) sdk.logger.info(`office-toolkit: post-run cleanup removed ${total} Office process(es) from job ${job.jobId}`); }))
+        .then((n) => { if (n > 0) sdk.logger.info(`office-toolkit: post-run cleanup removed ${n} Office process(es) spawned by job ${job.jobId}`); })
         .catch(() => {});
     });
     return { jobId, status: job.status, message: "转换任务已启动。使用 office_convert_status 查询进度，或 office_convert_cancel 取消。" };
@@ -523,18 +537,15 @@ export default defineApp(async (sdk) => {
     return n;
   }
 
-  // A headless Office/soffice process (no window title) is always an automation leftover: anything
-  // the user has open themselves shows a title. Used both before and after a job, so leftovers from
-  // an earlier crash cannot wedge the next run.
-  async function killHeadlessOfficeProcs() {
+  // Read-only companion to killJobSpawnedProcs. Earlier versions of this app KILLED every Office/
+  // WPS process that had no main window title, on the theory that "no title = automation leftover".
+  // That theory is wrong and destructive: WPS runs several wps.exe helpers, and an editor window
+  // shows no title while a large document is still loading. Killing those takes down a real editing
+  // session (observed 2026-10-09: a user's WPS session died and produced a recovery prompt right
+  // after a pre-run sweep). We now only REPORT candidates; nothing is killed on a guess.
+  async function listHeadlessOfficeProcs() {
     const procs = await listOfficeProcs();
-    let n = 0;
-    for (const p of procs) {
-      if (String(p.title || "").trim()) continue;
-      killPid(p.pid);
-      n++;
-    }
-    return n;
+    return procs.filter((p) => !String(p.title || "").trim());
   }
 
   // One cleanup routine behind both the tool and the panel button: temp dirs + recorded child
@@ -552,8 +563,8 @@ export default defineApp(async (sdk) => {
       killPid(job.officePid);
       killPid(job.workerPid);
     }
-    const zombies = await killHeadlessOfficeProcs();
-    return { swept, killed, zombies };
+    const candidates = await listHeadlessOfficeProcs();
+    return { swept, killed, candidates };
   }
 
   async function probeDeps() {
@@ -617,12 +628,16 @@ export default defineApp(async (sdk) => {
   await sdk.tools.register({
     name: "office_cleanup",
     description:
-      "清理本 App 留下的临时文件与僵尸进程。① 清扫 %TEMP% 下过期的运行目录（仅删一小时前的）；② 按任务记录结束已结束任务遗留的子进程；③ 清掉**无窗口标题**的 Office/soffice 进程——这类是自动化残留，你自己打开着的 Word/Excel 有窗口标题，不会被动。任务收尾时也会自动清；此工具用于手动兜底。confirm 必须显式传 true。",
+      "清理本 App 留下的临时文件与子进程。① 清扫 %TEMP% 下过期的运行目录（仅删一小时前的）；② 按任务记录结束本 App 自己起过的、已结束任务遗留的子进程。**不再按“无窗口标题”猜测并杀进程**：那条规则会误杀正在加载大文件的 WPS/Office 编辑会话（已出现真实事故），现在只报告可疑项、由你决定。confirm 必须显式传 true。",
     parameters: { type: "object", properties: { confirm: { type: "boolean", description: "必须显式传 true 才会执行。" } } },
     execute: async ({ confirm }) => {
       if (confirm !== true) return fail("将清扫临时目录，并按记录结束已结束任务遗留的子进程（仅限提前一小时内结束的任务，降低 PID 重用误杀风险）。同意后传 confirm=true 重试。");
       const r = await runCleanup();
-      return text(`清理完成：临时目录清扫${r.swept ? "已执行" : "跳过（脚本不可用）"}；按记录复核了 ${r.killed} 个历史子进程 PID（多数已自行退出）；实际清掉无窗口的僵尸 Office/soffice 进程 ${r.zombies} 个。`);
+      const cand = r.candidates || [];
+      const candText = cand.length
+        ? `另发现 ${cand.length} 个无窗口标题的 Office/WPS 进程（${cand.map((p) => `${p.name}#${p.pid}`).join(", ")}），**未动它们**——无标题不等于残留，可能是正在加载文档的编辑会话；确认后请手动处理。`
+        : "未发现无窗口标题的 Office/WPS 进程。";
+      return text(`清理完成：临时目录清扫${r.swept ? "已执行" : "跳过（脚本不可用）"}；按记录复核了 ${r.killed} 个历史子进程 PID（多数已自行退出）。${candText}`);
     },
   });
 
@@ -703,7 +718,7 @@ export default defineApp(async (sdk) => {
   await sdk.tools.register({
     name: "office_cli_run",
     description:
-      "执行一条 officecli 命令（参数以数组传入，不经 shell，不做通配/管道展开）。读操作可直接跑，例如 [\"get\",\"a.docx\",\"/body/p[1]\"]、[\"view\",\"a.docx\",\"outline\"]、[\"query\",\"a.xlsx\",\"cell\"]。写操作（set/add/remove/move/swap/raw-set/create/merge/import 等）请先向用户展示完整参数并获确认后再调用。涉及 .docx 的 refresh 需 Windows + Word。可用 cwd 指定工作目录。",
+      "执行一条 officecli 命令（参数以数组传入，不经 shell，不做通配/管道展开）。读操作可直接跑，例如 [\"get\",\"a.docx\",\"/body/p[1]\"]、[\"view\",\"a.docx\",\"outline\"]、[\"query\",\"a.xlsx\",\"cell\"]。写操作（set/add/remove/move/swap/raw-set/create/merge/import 等）请先向用户展示完整参数并获确认后再调用。涉及 .docx 的 refresh 需 Windows + Word。可用 cwd 指定工作目录。\n\n已知边界：officecli 只认新版 DrawingML，对老式 VML 浮动图（w:pict / v:shape）不可见——view outline 会报 0 images、query picture 返回空。遇到这种情况不要断言「文档里没图」，改用 raw / raw-set 读取，或交给 office_convert 让 Word/WPS 处理。",
     parameters: {
       type: "object",
       properties: {
@@ -758,8 +773,616 @@ export default defineApp(async (sdk) => {
   });
 
   await sdk.tools.register({
+    name: "office_images",
+    description:
+      "列出 .docx 里的所有图片，包含 officecli 自己看不见的老式 VML 浮动图。officecli 的 query picture / view outline 只认新版 DrawingML，w:pict / v:shape 这类老式浮动图会被它漏掉，据此判断“文档里没图”是错的。本工具直接解析文档 XML（经 officecli raw），分别统计老式 VML 与新式 DrawingML，并给出每张图的尺寸、位置与描边。只读，不修改文件。",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: ".docx 文件路径。" },
+        verbose: { type: "boolean", description: "true 时逐张列出（id/尺寸/位置/描边/关系 id）。默认只给汇总。" },
+        maxItems: { type: "number", description: "verbose 时最多列多少张，默认 40。" },
+        contains: { type: "string", description: "verbose 时只列包含这个字串的图形（匹配 id / style / 标题），便于在大文档里直奔目标。" },
+      },
+      required: ["path"],
+    },
+    execute: async ({ path: p, verbose, maxItems, contains }) => {
+      const file = String(p || "").trim();
+      if (!file) return fail("缺少 path（.docx 文件路径）。");
+      if (!/\.docx$/i.test(file)) return fail("只处理 .docx；老式 .doc 请先用 office_convert 转成 .docx。");
+      const r = await cli(["raw", file, "/document"], { timeoutMs: TIMEOUT.run });
+      if (r.enoent) return fail("未找到 officecli。先用 office_cli_status 诊断。");
+      if (!r.ok) return fail(`读取文档 XML 失败（${describe(r)}）。\n${clip(combine(r.stdout, r.stderr) || r.message, 2000)}`);
+      const xml = String(r.stdout || "");
+      if (!xml.trim()) return fail("officecli raw 返回为空，无法解析。");
+
+      const hits = (re) => (xml.match(re) || []).length;
+      const tags = (re) => xml.match(re) || [];
+      const attr = (tag, name) => {
+        const m = tag.match(new RegExp(name.replace(/[:.]/g, "\\$&") + '="([^"]*)"', "i"));
+        return m ? m[1] : "";
+      };
+      const emu2cm = (v) => {
+        const n = Number(v);
+        return Number.isFinite(n) && n > 0 ? `${(n / 360000).toFixed(2)}cm` : "";
+      };
+
+      // Legacy VML. \b after "shape" keeps v:shapetype (18 of 20 in a real sample) out of the count.
+      const vShapes = tags(/<v:shape\b[^>]*>/gi);
+      const vImages = tags(/<v:imagedata\b[^>]*>/gi);
+      const pictCount = hits(/<w:pict\b/gi);
+      const groupCount = hits(/<v:group\b/gi);
+      // Modern DrawingML.
+      const drawings = hits(/<w:drawing\b/gi);
+      const anchors = tags(/<wp:anchor\b[^>]*>/gi);
+      const inlines = hits(/<wp:inline\b/gi);
+      const extents = tags(/<wp:extent\b[^>]*>/gi);
+      const blips = tags(/<a:blip\b[^>]*>/gi);
+
+      const vmlVis = vShapes.filter((t) => {
+        const st = attr(t, "style").toLowerCase();
+        return st.includes("position:absolute") || st.includes("margin-left") || st.includes("margin-top");
+      }).length;
+
+      const lines = [];
+      lines.push(`${file}`);
+      lines.push(`老式 VML：v:shape ${vShapes.length} 个（其中浮动定位 ${vmlVis} 个），w:pict ${pictCount} 个，v:imagedata ${vImages.length} 个，v:group ${groupCount} 个`);
+      lines.push(`新式 DrawingML：w:drawing ${drawings} 个（浮动 wp:anchor ${anchors.length}、内联 wp:inline ${inlines}），a:blip ${blips.length} 个`);
+      lines.push("");
+      if (vShapes.length > 0) {
+        lines.push("注意：officecli 自己的 query picture 只能看到新式的 " + drawings + " 个，上面 " + vShapes.length + " 个 VML 图形它看不见。");
+        lines.push("不要据此判断文档里没有图；要改这类图请用 raw / raw-set，或交给 office_convert 让 Word/WPS 处理。");
+      } else if (drawings === 0) {
+        lines.push("两种图片都没有计数到，可以认为文档内确实无图。");
+      }
+
+      if (verbose) {
+        const limit = Number.isFinite(Number(maxItems)) && Number(maxItems) > 0 ? Number(maxItems) : 40;
+        const needle = String(contains || "").trim().toLowerCase();
+        const keep = (t) => !needle || String(t).toLowerCase().includes(needle);
+        const visShapes = needle ? vShapes.filter(keep) : vShapes;
+        const visImages = needle ? vImages.filter(keep) : vImages;
+        const visBlips = needle ? blips.filter(keep) : blips;
+        lines.push("");
+        lines.push("--- VML 图形（officecli 不可见）---");
+        if (visShapes.length === 0) lines.push(needle ? "（无匹配）" : "（无）");
+        visShapes.slice(0, limit).forEach((t, i) => {
+          const id = attr(t, "id") || `#${i + 1}`;
+          const style = attr(t, "style");
+          const stroke = [attr(t, "strokecolor"), attr(t, "strokeweight"), attr(t, "stroked")].filter(Boolean).join(" / ");
+          lines.push(`${id}  style='${clip(style, 160)}'${stroke ? `  stroke={${stroke}}` : ""}`);
+        });
+        if (visShapes.length > limit) lines.push(`… 还有 ${visShapes.length - limit} 个未列出`);
+        lines.push("");
+        lines.push("--- VML 内嵌图片关系 ---");
+        if (visImages.length === 0) lines.push(needle ? "（无匹配）" : "（无）");
+        visImages.slice(0, limit).forEach((t) => {
+          lines.push(`r:id=${attr(t, "r:id") || "?"}${attr(t, "o:title") ? `  title='${attr(t, "o:title")}'` : ""}`);
+        });
+        lines.push("");
+        lines.push("--- 新式 DrawingML ---");
+        if (anchors.length + inlines === 0) lines.push("（无）");
+        anchors.slice(0, limit).forEach((t, i) => {
+          const ex = extents[i] || "";
+          lines.push(`anchor ${i + 1}  ${emu2cm(attr(ex, "cx"))} x ${emu2cm(attr(ex, "cy"))}  behindDoc=${attr(t, "behindDoc") || "0"}  relativeHeight=${attr(t, "relativeHeight") || ""}`);
+        });
+        blips.slice(0, limit).filter(keep).forEach((t, i) => {
+          lines.push(`blip ${i + 1}  r:embed=${attr(t, "r:embed") || "?"}`);
+        });
+      }
+      return text(lines.join("\n"));
+    },
+  });
+
+  await sdk.tools.register({
+    name: "office_add_image",
+    description:
+      "向 .docx 插入图片（默认浮动锤定）。officecli 的 add picture 本身就能做浮动插入（anchor=true），但它默认的参考系是段落/行，给负偏移或大偏移时图会跑到页眉/页脚上去——所以本工具把 hRelative/vRelative 默认钉成 page，并把长度参数的坑堵上：裸数字在 officecli 里会被当成 EMU（914400 每英寸），本工具一律按厘米处理。可选 anchorText 用文本定位（插到包含该文字的段落之后）。写操作，会修改文档，调用前先向用户确认参数。",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: ".docx 文件路径。" },
+        image: { type: "string", description: "图片文件路径（png/jpg 等）。" },
+        anchorText: { type: "string", description: "插到包含这段文字的段落之后（可用 --after find: 定位）；省略则追加到文档末尾。" },
+        parent: { type: "string", description: "父节点路径，默认 /body。" },
+        inline: { type: "boolean", description: "true = 内联图（随文字走）；默认 false = 浮动锤定图。" },
+        width: { type: "number", description: "宽（厘米）。省略则用图片原始尺寸。" },
+        height: { type: "number", description: "高（厘米）。建议与 width 同给，避免被拉伸。" },
+        hPosition: { type: "number", description: "水平偏移（厘米），相对 hRelative。" },
+        vPosition: { type: "number", description: "垂直偏移（厘米），相对 vRelative。" },
+        hRelative: { type: "string", description: "水平参考系：page/margin/column/character，默认 page。" },
+        vRelative: { type: "string", description: "垂直参考系：page/margin/paragraph/line，默认 page。" },
+        hAlign: { type: "string", description: "水平对齐（left/center/right），给了它就忽略 hPosition。" },
+        vAlign: { type: "string", description: "垂直对齐（top/bottom/center），给了它就忽略 vPosition。" },
+        wrap: { type: "string", description: "环绕方式：none/square/tight/topandbottom/through。" },
+        behindText: { type: "boolean", description: "true = 图衬在文字下方（配合 wrap=none）。" },
+        alt: { type: "string", description: "替代文字（无障碍/可检索性）。" },
+        caption: { type: "string", description: "把图注烧进图片（可选路线）。适合只用于打印、不需要检索的场景。注意：图注会变成像素，不可搜索/编辑/复制，且字号会跟着图片缩放。烧入时必须同时给 width，否则字号算不准。" },
+        captionSizePt: { type: "number", description: "图注在文档里应显示的字号（磅），默认 9。" },
+        captionFont: { type: "string", description: "图注字体，默认 SimSun（宋体）。" },
+        captionColor: { type: "string", description: "图注颜色，默认 #000000。" },
+        captionGap: { type: "number", description: "图与图注之间的间距（像素），默认 12。" },
+        captionAlign: { type: "string", description: "图注对齐：center（默认）/ left。" },
+        border: { type: "string", description: "描边：如 1pt:#FFC000、2pt #FF0000、#FFC000（只给颜色则默认 1pt）、none（不加）。单位支持 pt/cm/px。默认不加。officecli 本身无边框属性，这里是拿到图后按 paraId 精确定位 spPr 注入 <a:ln>。" },
+        healCheck: { type: "boolean", description: "true 时在改完边框后跑一次 validate 校验文档结构，默认 true。" },
+        dryRun: { type: "boolean", description: "true 时只回显将执行的 officecli 参数，不真写。" },
+      },
+      required: ["path", "image"],
+    },
+    execute: async ({ path: p, image, anchorText, parent, inline, width, height, hPosition, vPosition, hRelative, vRelative, hAlign, vAlign, wrap, behindText, alt, caption, captionSizePt, captionFont, captionColor, captionGap, captionAlign, border, healCheck, dryRun }) => {
+      const file = String(p || "").trim();
+      const img = String(image || "").trim();
+      if (!file) return fail("缺少 path（.docx 文件路径）。");
+      if (!/\.docx$/i.test(file)) return fail("只处理 .docx；老式 .doc 请先用 office_convert 转成 .docx。");
+      if (!img) return fail("缺少 image（图片路径）。");
+
+      // Optional route: burn the caption into the picture so photo+caption go in as a single element.
+      let effectiveImage = img;
+      const capNotes = [];
+      if (caption) {
+        if (width === undefined || width === null || width === "") {
+          return fail("烧入图注时请同时给 width（厘米）。图注字号是按「图片在文档里的实际宽度」换算的，不给就没法算准。");
+        }
+        ensureWorkDir();
+        const capFile = path.join(workDir, `caption_${randomUUID()}.txt`);
+        const composed = path.join(workDir, `composed_${randomUUID()}.png`);
+        try {
+          fs.writeFileSync(capFile, String(caption), "utf8");
+          const pwsh = await resolvePwsh();
+          const cr = await run(pwsh, [
+            "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", COMPOSE_CAPTION,
+            "-Image", img, "-Out", composed, "-CaptionFile", capFile,
+            "-InsertWidthCm", String(width), "-SizePt", String(captionSizePt === undefined ? 9 : captionSizePt),
+            "-FontName", String(captionFont || "SimSun"), "-Color", String(captionColor || "#000000"),
+            "-GapPx", String(captionGap === undefined ? 12 : captionGap), "-Align", String(captionAlign || "center"),
+          ], { timeoutMs: TIMEOUT.run });
+          if (!cr.ok) return fail(`图注合成失败（${describe(cr)}）。\n${clip(combine(cr.stdout, cr.stderr) || cr.message, 2000)}`);
+          let info = null;
+          try { info = JSON.parse(String(cr.stdout).trim().split(/\r?\n/).at(-1)); } catch { /* 下面统一报错 */ }
+          if (!info || !info.ok) return fail(`图注合成未返回有效结果：${clip(cr.stdout, 500)}`);
+          effectiveImage = String(info.out);
+          capNotes.push(`图注已烧进图片：${info.width}x${info.height}，字号 ${info.fontPt}pt${info.mappedPt ? `（按插入宽度 ${width}cm 换算）` : "（未按宽度换算）"}。`);
+          capNotes.push("提醒：图注现已是像素，不可搜索/编辑/复制，且会随图片缩放。需要可检索的文字图注请用 office_insert_caption。");
+        } finally {
+          try { fs.unlinkSync(capFile); } catch {}
+        }
+      }
+
+      // Bare numbers are EMU to officecli, which silently makes an invisible image. Always send cm.
+      const len = (v) => (v === undefined || v === null || v === "" ? "" : `${String(v).trim()}cm`);
+      const props = [`src=${effectiveImage}`];
+      const notes = [];
+      if (!inline) {
+        props.push("anchor=true");
+        // Defaulting the reference frames to the page is the whole point: officecli's own default is
+        // paragraph/line, so a large or negative offset slams the image into the header.
+        props.push(`hRelative=${String(hRelative || "page")}`);
+        props.push(`vRelative=${String(vRelative || "page")}`);
+        notes.push(`参考系：水平=${String(hRelative || "page")}、垂直=${String(vRelative || "page")}`);
+      }
+      if (width !== undefined && width !== null && width !== "") props.push(`width=${len(width)}`);
+      if (height !== undefined && height !== null && height !== "") props.push(`height=${len(height)}`);
+      if (!inline && hAlign) props.push(`hAlign=${String(hAlign)}`);
+      else if (!inline && hPosition !== undefined && hPosition !== null && hPosition !== "") props.push(`hPosition=${len(hPosition)}`);
+      if (!inline && vAlign) props.push(`vAlign=${String(vAlign)}`);
+      else if (!inline && vPosition !== undefined && vPosition !== null && vPosition !== "") props.push(`vPosition=${len(vPosition)}`);
+      if (!inline && wrap) props.push(`wrap=${String(wrap)}`);
+      if (!inline && behindText === true) props.push("behindText=true");
+      if (alt) props.push(`alt=${String(alt)}`);
+
+      const argv = ["add", file, String(parent || "/body"), "--type", "picture"];
+      for (const kv of props) argv.push("--prop", kv);
+      if (anchorText) argv.push("--after", `find:${String(anchorText)}`);
+
+      if (dryRun === true) {
+        return text(`将执行（dryRun，未写入）：\nofficecli ${argv.map((a) => (a.includes(" ") ? `"${a}"` : a)).join(" ")}\n\n${notes.join("\n")}`);
+      }
+      const r = await cli(argv, { timeoutMs: TIMEOUT.run });
+      if (r.enoent) return fail("未找到 officecli。先用 office_cli_status 诊断。");
+      if (!r.ok) {
+        return fail(
+          `插入失败（${describe(r)}）。\n${clip(combine(r.stdout, r.stderr) || r.message, 4000)}`,
+          "常见原因：图片路径不存在、anchorText 没匹配到段落、或文档正被 Word/WPS 占用。",
+        );
+      }
+      const out = clip(combine(r.stdout, r.stderr) || "(无输出)", 2000);
+      const extra = [];
+
+      // Border. officecli's picture has no line/border property at all, so the stroke is injected as
+      // <a:ln> into the picture's own pic:spPr, scoped by the paragraph id that add just reported.
+      // Appending is schema-legal: <a:ln> follows xfrm/geom in CT_ShapeProperties.
+      const bw = (() => {
+        const s = String(border || "").trim();
+        if (!s || s.toLowerCase() === "none") return null;
+        const colorM = s.match(/#([0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})/);
+        const widthM = s.match(/([\d.]+)\s*(pt|cm|px)?/i);
+        const factor = { pt: 12700, cm: 360000, px: 9525 };
+        const unit = (widthM && widthM[2] ? widthM[2] : "pt").toLowerCase();
+        const num = widthM && widthM[1] ? Number(widthM[1]) : 1;
+        const emu = Math.max(1, Math.round((Number.isFinite(num) && num > 0 ? num : 1) * (factor[unit] || 12700)));
+        return { emu, color: colorM ? colorM[1].slice(0, 6).toUpperCase() : "000000" };
+      })();
+
+      if (bw) {
+        const pid = (String(r.stdout || "").match(/paraId=([0-9A-Fa-f]+)/) || [])[1];
+        if (!pid) {
+          extra.push(`边框未加：没能从 add 的返回里取到 paraId（原文：${clip(r.stdout, 200)}）。请用 office_cli_run 走 raw-set 自己加。`);
+        } else {
+          const frag = `<a:ln xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" w="${bw.emu}"><a:solidFill><a:srgbClr val="${bw.color}"/></a:solidFill></a:ln>`;
+          const xp = `//w:p[@w14:paraId='${pid}']//pic:spPr`;
+          const br = await cli(["raw-set", file, "/document", "--xpath", xp, "--action", "append", "--xml", frag], { timeoutMs: TIMEOUT.run });
+          if (br.ok) {
+            extra.push(`已加描边 ${(bw.emu / 12700).toFixed(2)}pt #${bw.color}（定位 ${xp}）`);
+            if (healCheck !== false) {
+              const vr = await cli(["validate", file], { timeoutMs: TIMEOUT.run });
+              extra.push(`结构校验：${clip(combine(vr.stdout, vr.stderr) || "(无输出)", 200)}`);
+            }
+          } else {
+            extra.push(`边框注入失败（${describe(br)}）：${clip(combine(br.stdout, br.stderr) || br.message, 400)}`);
+          }
+        }
+      } else {
+        extra.push("未加描边（默认无框；需要时传 border=\"1pt:#FFC000\"）。");
+      }
+      return text([out, capNotes.join("\n"), notes.join("\n"), extra.filter(Boolean).join("\n")].filter(Boolean).join("\n"));
+    },
+  });
+
+  await sdk.tools.register({
+    name: "office_render_preview",
+    description:
+      "把 .docx 渲染成页面预览图（PNG），用于校版式。走 officecli 的 view screenshot，在 Windows 上可用原生 Word 渲染，与打印效果一致。单页用 page，整本缩略图用 grid。生成的 PNG 会直接写盘并返回路径，可用 read 当图看。注意：officecli 没有 docx→pdf 导出器（view pdf 会报 No exporter plugin），要 PDF 请用 office_convert(to=\"pdf\")，那条走 Word COM、同样无声。本工具只读文档，不修改它。",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: ".docx 文件路径。" },
+        page: { type: "string", description: "页码或区间，如 3 或 1-3 或 1,3,5。省略时默认第 1 页。" },
+        grid: { type: "number", description: "整本缩略图拼图：传列数（如 3），或传 0 自动选列。给了它就不看 page。" },
+        out: { type: "string", description: "输出 PNG 路径。省略则放在源文件旁的 _preview 子目录。" },
+        width: { type: "number", description: "视口宽（像素），默认 1600。" },
+        height: { type: "number", description: "视口高（像素），默认 1200。" },
+        range: { type: "string", description: "只裁某个区域的包围盒，便于放大看细节。传元素路径（如 /body/table[1]、/body/p[12]）或表格单元格区间（Sheet1!A1:C3）。" },
+        render: { type: "string", description: "渲染通道：auto（默认，Windows 上有 Word/PowerPoint 就走原生）、native（强制原生，没有则报错）、html（强制 HTML 通道）。想跟打印一致就用 native。" },
+      },
+      required: ["path"],
+    },
+    execute: async ({ path: p, page, grid, out, width, height, range, render }) => {
+      const file = String(p || "").trim();
+      if (!file) return fail("缺少 path（.docx 文件路径）。");
+      if (!/\.docx$/i.test(file)) return fail("只处理 .docx；老式 .doc 请先用 office_convert 转成 .docx。");
+
+      const dir = file.replace(/[\\\/][^\\\/]*$/, "");
+      const base = (file.match(/([^\\\/]+)\.docx$/i) || [, "doc"])[1];
+      const useGrid = grid !== undefined && grid !== null && grid !== "";
+      const tag = useGrid ? `grid${Number(grid) > 0 ? Number(grid) : "auto"}` : `p${String(page || "1").replace(/[,\-]/g, "_")}`;
+      const outPath = String(out || "").trim() || `${dir}\\_preview\\${base}_${tag}.png`;
+
+      // officecli does not create missing parent directories (it fails with "Could not find a part
+      // of the path"), so materialise the output folder first. The App's PowerShell child can write
+      // outside its own dataDir, which is why this goes through pwsh instead of node fs.
+      const outDir = outPath.replace(/[\\\/][^\\\/]*$/, "");
+      if (outDir) {
+        try {
+          const pwsh = await resolvePwsh();
+          await run(pwsh, ["-NoProfile", "-NonInteractive", "-Command", `New-Item -ItemType Directory -Force -Path '${outDir.replace(/'/g, "''")}' | Out-Null`], { timeoutMs: 20_000 });
+        } catch { /* 建不出来就让 officecli 自己报错，错误信息更具体 */ }
+      }
+
+      const argv = ["view", file, "screenshot"];
+      if (useGrid) argv.push("--grid", String(Number(grid) > 0 ? Number(grid) : "auto"));
+      else argv.push("--page", String(page || "1"));
+      if (width) argv.push("--screenshot-width", String(width));
+      if (height) argv.push("--screenshot-height", String(height));
+      if (range) argv.push("--range", String(range));
+      if (render) argv.push("--render", String(render));
+      argv.push("-o", outPath);
+
+      const r = await cli(argv, { timeoutMs: TIMEOUT.runMax });
+      if (r.enoent) return fail("未找到 officecli。先用 office_cli_status 诊断。");
+      if (!r.ok) {
+        return fail(
+          `渲染失败（${describe(r)}）。\n${clip(combine(r.stdout, r.stderr) || r.message, 3000)}`,
+          "如果报 No exporter plugin，说明该 officecli 没装渲染插件；改用 office_convert(to=\"pdf\") 出 PDF 再看。",
+        );
+      }
+      const note = [
+        `渲染完成：${outPath}`,
+        "（可直接用 read 读这个 PNG 校版式；要 PDF 用 office_convert 传 to=\"pdf\"。）",
+      ].join("\n");
+      return text([clip(r.stdout, 800), note].filter(Boolean).join("\n"));
+    },
+  });
+
+  await sdk.tools.register({
+    name: "office_insert_caption",
+    description:
+      "在 .docx 里插入图注段落（文字，与原件风格一致）。可用 template 克隆文档里已有的某个图注段（格式完全继承），或用 style/font/align/indent/spaceBefore 等参数自己描。left+right 时按 separatorSpaces 个空格拼成一行两条（复刻原件一栏两图的写法）。keepNext/keepLines 默认关：它们会在 Word 左边距留可见黑方块，要交出去的文档请改用隐形表格 + cantSplit 防拆散。写操作，会修改文档，调用前先向用户确认参数。",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: ".docx 文件路径。" },
+        text: { type: "string", description: "图注文字。与 left/right 二选一。" },
+        left: { type: "string", description: "左栏图注（与 right 一起用，中间用空格分隔）。" },
+        right: { type: "string", description: "右栏图注。" },
+        separatorSpaces: { type: "number", description: "left 与 right 之间的空格数，默认 27（原件写法）。" },
+        template: { type: "string", description: "克隆源段落路径（如 /body/p[21]），格式完全继承它。推荐从文档自身已有图注段拷。" },
+        after: { type: "string", description: "插到包含这段文字的段落之后。" },
+        afterPath: { type: "string", description: "插到这个段落路径之后（如 /body/p[12]），与 after 二选一。" },
+        before: { type: "string", description: "插到包含这段文字的段落之前。" },
+        style: { type: "string", description: "段落样式 id（如 Normal、caption、题注）。" },
+        font: { type: "string", description: "字体名（如宋体、Times New Roman）。" },
+        align: { type: "string", description: "对齐：left/center/right/justify。" },
+        indent: { type: "string", description: "左缩进（带单位，如 0.5cm、12pt）。" },
+        firstLineIndent: { type: "string", description: "首行缩进（带单位）。" },
+        spaceBefore: { type: "string", description: "段前距（带单位，如 3pt）。" },
+        spaceAfter: { type: "string", description: "段后距（带单位）。" },
+        lineSpacing: { type: "string", description: "行距（如 1.5、14pt）。" },
+        lineRule: { type: "string", description: "行距规则：auto/exact/atLeast。" },
+        charSpacing: { type: "number", description: "字符间距（pt），需要把图注拉宽时用。" },
+        keepNext: { type: "boolean", description: "与下段同页（默认 false）。注意：Word 开启「显示编辑标记」时，带分页属性的段落会在左边距显出一竖列黑方块；要交给别人的正式文档不要默认开，防拆散请用无边框单格表格 + cantSplit。" },
+        keepLines: { type: "boolean", description: "整段不拆行（默认 false）。同上：会在 Word 左边距留可见标记。" },
+        dryRun: { type: "boolean", description: "true 时只回显将执行的 officecli 参数，不真写。" },
+      },
+      required: ["path"],
+    },
+    execute: async ({ path: p, text, left, right, separatorSpaces, template, after, afterPath, before, style, font, align, indent, firstLineIndent, spaceBefore, spaceAfter, lineSpacing, lineRule, charSpacing, keepNext, keepLines, dryRun }) => {
+      const file = String(p || "").trim();
+      if (!file) return fail("缺少 path（.docx 文件路径）。");
+      if (!/\.docx$/i.test(file)) return fail("只处理 .docx；老式 .doc 请先用 office_convert 转成 .docx。");
+      const sep = Number.isFinite(Number(separatorSpaces)) && Number(separatorSpaces) >= 0 ? Number(separatorSpaces) : 27;
+      let body = String(text || "");
+      if (!body && (left || right)) body = `${String(left || "")}${" ".repeat(sep)}${String(right || "")}`;
+      if (!body) return fail("缺少图注内容：传 text，或同时传 left 与 right。");
+      if (!after && !afterPath && !before) {
+        return fail("需要指定插入位置：传 after（文本定位）、afterPath（段落路径）或 before 之一。");
+      }
+
+      const props = [`text=${body}`];
+      // keepNext/keepLines default OFF. They do stop a caption splitting away from its photo, but Word
+      // paints a visible black square in the left margin for paragraphs carrying page-break properties
+      // (seen with formatting marks on; a user rejected a delivery over exactly this). For a document
+      // that goes to someone else, the anti-split mechanism should be an invisible single-cell table
+      // with cantSplit, which leaves no mark.
+      const kn = keepNext === true;
+      const kl = keepLines === true;
+      if (kn) props.push("keepNext=true");
+      if (kl) props.push("keepLines=true");
+      if (style) props.push(`style=${String(style)}`);
+      if (font) props.push(`font=${String(font)}`);
+      if (align) props.push(`align=${String(align)}`);
+      if (indent) props.push(`indent=${String(indent)}`);
+      if (firstLineIndent) props.push(`firstLineIndent=${String(firstLineIndent)}`);
+      if (spaceBefore) props.push(`spaceBefore=${String(spaceBefore)}`);
+      if (spaceAfter) props.push(`spaceAfter=${String(spaceAfter)}`);
+      if (lineSpacing) props.push(`lineSpacing=${String(lineSpacing)}`);
+      if (lineRule) props.push(`lineRule=${String(lineRule)}`);
+      if (charSpacing !== undefined && charSpacing !== null && charSpacing !== "") props.push(`charSpacing=${String(charSpacing)}`);
+
+      const anchorArgs = [];
+      if (afterPath) anchorArgs.push("--after", String(afterPath));
+      else if (after) anchorArgs.push("--after", `find:${String(after)}`);
+      else if (before) anchorArgs.push("--before", `find:${String(before)}`);
+
+      // With a template we clone that paragraph (formatting inherited verbatim) and then overwrite
+      // only the text; without one we create a fresh paragraph and set every property explicitly.
+      const argv = template
+        ? ["add", file, "/body", "--from", String(template), ...anchorArgs]
+        : ["add", file, "/body", "--type", "paragraph", ...props.flatMap((kv) => ["--prop", kv]), ...anchorArgs];
+
+      if (dryRun === true) {
+        const q = (a) => (a.includes(" ") ? `"${a}"` : a);
+        const lines = [`将执行（dryRun，未写入）：`, `officecli ${argv.map(q).join(" ")}`];
+        if (template) lines.push(`然后 set 文本：officecli set ${q(file)} <新段落> --prop ${q("text=" + body)}`);
+        return text(lines.join("\n"));
+      }
+
+      const r = await cli(argv, { timeoutMs: TIMEOUT.run });
+      if (r.enoent) return fail("未找到 officecli。先用 office_cli_status 诊断。");
+      if (!r.ok) {
+        return fail(
+          `插入失败（${describe(r)}）。\n${clip(combine(r.stdout, r.stderr) || r.message, 4000)}`,
+          "常见原因：template 或 afterPath 不存在、after 的文字没匹配到、文档被 Word/WPS 占用。",
+        );
+      }
+      const lines = [clip(combine(r.stdout, r.stderr) || "(无输出)", 1500)];
+
+      if (template) {
+        // Two shapes come back depending on the route: "Added paragraph at /body/p[@paraId=X]" and
+        // "Copied to /body/p[N]". Accept either, otherwise the clone silently keeps the template text.
+        const outStr = String(r.stdout || "");
+        const pid = (outStr.match(/paraId=([0-9A-Fa-f]+)/) || [])[1];
+        const pIdx = (outStr.match(/\/body\/p\[(\d+)\]/) || [])[1];
+        const target = pid ? `/body/p[@paraId=${pid}]` : pIdx ? `/body/p[${pIdx}]` : "";
+        if (!target) {
+          lines.push(`已克隆 ${template}，但没从返回里识别出目标段落（原文：${clip(outStr, 200)}），文本未替换。请用 office_cli_run 的 set 手动改。`);
+        } else {
+          const setArgs = ["set", file, target];
+          for (const kv of props) setArgs.push("--prop", kv);
+          const sr = await cli(setArgs, { timeoutMs: TIMEOUT.run });
+          lines.push(sr.ok ? `已克隆模板并写入文本（目标 ${target}）` : `克隆成功但 set 文本失败：${clip(combine(sr.stdout, sr.stderr) || sr.message, 400)}`);
+        }
+      } else {
+        lines.push("已插入图注段。");
+      }
+      if (kn || kl) {
+        lines.push("注意：已按你的要求加了 keepNext/keepLines。Word 开启「显示编辑标记」时会在左边距显出黑方块；正式交付前建议改用隐形表格 + cantSplit。");
+      }
+      return text(lines.join("\n"));
+    },
+  });
+
+  await sdk.tools.register({
+    name: "office_insert_photo_rows",
+    description:
+      "按文档自身版式批量插入现场照片行（克隆原语）。针对 A3 横版双欄、含老式 VML 浮动图的工程文档：从目标文档自己的图片段/空行/图注段取模板，只换图片与图注文字，每行套隐形表格 + cantSplit 防跳欄拆散。这是报告里最有效的那条原语——跨文档套模板必然错位，所以几何一律从本文档自己算。rows 为数组，每项 {left:{img,cap}, right:{img,cap}}（左右可缺一个）。写操作，会修改文档（默认另存为 _withphotos.docx），调用前先向用户确认。",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "源 .docx 路径。" },
+        rows: { type: "array", description: "照片行数组：[{left:{img,cap},right:{img,cap}}, ...]。img 是图片路径，cap 是图注文字。", items: { type: "object" } },
+        out: { type: "string", description: "输出路径。省略则写在源文件旁，名字加 _withphotos 后缀。" },
+        anchorText: { type: "string", description: "插到这个文字所在段落之前（如“变更内容”）。省略则插到文末 sectPr 之前。" },
+        targetWidth: { type: "number", description: "内嵌照片宽（像素），默认 1040，控制成品体积。" },
+        quality: { type: "number", description: "JPEG 质量，默认 82。" },
+        borderColor: { type: "string", description: "VML 描边颜色（如 #FFC000）或 none（默认，不加框）。" },
+        photoGapPt: { type: "number", description: "同排两图间距（pt）。省略时默认 24。" },
+        rowGapExtra: { type: "number", description: "每行后额外空行数，默认 0。" },
+        captionGapExtra: { type: "number", description: "图注上方额外空行数，默认 0。" },
+        dryRun: { type: "boolean", description: "true 时只回显参数与将执行的命令，不写入。" },
+      },
+      required: ["path", "rows"],
+    },
+    execute: async ({ path: p, rows, out, anchorText, targetWidth, quality, borderColor, photoGapPt, rowGapExtra, captionGapExtra, dryRun }) => {
+      const file = String(p || "").trim();
+      if (!file) return fail("缺少 path（源 .docx）。");
+      if (!/\.docx$/i.test(file)) return fail("只处理 .docx。");
+      const list = Array.isArray(rows) ? rows : [];
+      if (list.length === 0) return fail("rows 为空：至少给一行 {left:{img,cap}} 或 {right:{img,cap}}。");
+      const bad = list.findIndex((r) => {
+        if (!r || typeof r !== "object") return true;
+        const okOne = (n) => n && typeof n === "object" && String(n.img || "").trim();
+        return !okOne(r.left) && !okOne(r.right);
+      });
+      if (bad >= 0) return fail(`rows[${bad}] 无效：每行至少要有 left 或 right，且其 img 不能为空。`);
+
+      ensureWorkDir();
+      const specFile = path.join(workDir, `rows_${randomUUID()}.json`);
+      fs.writeFileSync(specFile, JSON.stringify(list), "utf8");
+      const argv = [
+        "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", INSERT_ROWS,
+        "-Docx", file, "-SpecJson", specFile,
+      ];
+      if (out) argv.push("-Out", String(out));
+      if (anchorText) argv.push("-AnchorText", String(anchorText));
+      if (targetWidth !== undefined && targetWidth !== null && targetWidth !== "") argv.push("-TargetW", String(targetWidth));
+      if (quality !== undefined && quality !== null && quality !== "") argv.push("-Quality", String(quality));
+      if (borderColor) argv.push("-BorderColor", String(borderColor));
+      if (photoGapPt !== undefined && photoGapPt !== null && photoGapPt !== "") argv.push("-PhotoGapPt", String(photoGapPt));
+      if (rowGapExtra) argv.push("-RowGapExtra", String(rowGapExtra));
+      if (captionGapExtra) argv.push("-CaptionGapExtra", String(captionGapExtra));
+
+      if (dryRun === true) {
+        try { fs.unlinkSync(specFile); } catch {}
+        const q = (a) => (a.includes(" ") ? `"${a}"` : a);
+        return text(`将执行（dryRun，未写入）：\n${argv.map(q).join(" ")}\n\n共 ${list.length} 行；锚点=${anchorText || "（文末）"}。`);
+      }
+
+      try {
+        const pwsh = await resolvePwsh();
+        const r = await run(pwsh, argv, { timeoutMs: TIMEOUT.runMax });
+        if (!r.ok) {
+          return fail(
+            `插入失败（${describe(r)}）。\n${clip(combine(r.stdout, r.stderr) || r.message, 4000)}`,
+            "常见原因：图片路径不存在、anchorText 没匹配到、目标 docx 被 Office/WPS 占用、或 rows 里 img 写错。",
+          );
+        }
+        let info = null;
+        try { info = JSON.parse(String(r.stdout).trim().split(/\r?\n/).at(-1)); } catch { /* 下面统一报错 */ }
+        if (!info || !info.ok) return fail(`脚本没返回有效结果：${clip(r.stdout, 800)}`);
+        const extra = [
+          "",
+          `产出：${info.out}`,
+          `照片 ${info.photos} 张 / ${info.rows} 行；模板来源 ${info.template}；行高 ${info.rowHeight}pt；栏宽 ${info.colWidth}pt（图框 ${info.boxW}pt）；图注制表位 ${info.tabs}`,
+          "防拆散用的是隐形表格 + cantSplit，不会在 Word 左边距留黑方块。建议再用 office_render_preview 渲染校版。",
+        ];
+        return text([clip(r.stdout, 400), extra.join("\n")].join("\n"));
+      } finally {
+        try { fs.unlinkSync(specFile); } catch {}
+      }
+    },
+  });
+
+  await sdk.tools.register({
+    name: "office_doc_geometry",
+    description:
+      "读出一个 .docx 的版式几何量：页面尺寸与边距、分欄数与欄间距、算出欄宽，并给出推荐的图框尺寸与左右位置；同时列出文档里已有浮动图（VML）的 margin-top/left/width/height 与图注段落样本。用途：按原件尺寸对齐插图，避免跨文档套模板导致错位。只读，不修改文件。",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: ".docx 文件路径。" },
+        gapPt: { type: "number", description: "同排两图间距（pt），默认 24。" },
+        cap: { type: "number", description: "图框宽上限（pt），默认 224。" },
+        ratio: { type: "number", description: "图框高宽比的分母：高 = 宽 × ratio / 4（默认 3 即 4:3）。" },
+      },
+      required: ["path"],
+    },
+    execute: async ({ path: p, gapPt, cap, ratio }) => {
+      const file = String(p || "").trim();
+      if (!file) return fail("缺少 path（.docx 文件路径）。");
+      if (!/\.docx$/i.test(file)) return fail("只处理 .docx。");
+      const r = await cli(["raw", file, "/document"], { timeoutMs: TIMEOUT.run });
+      if (r.enoent) return fail("未找到 officecli。");
+      if (!r.ok) return fail(`读取文档 XML 失败（${describe(r)}）。`);
+      const xml = String(r.stdout || "");
+      const num = (re, s) => {
+        const m = (s || xml).match(re);
+        return m ? Number(m[1]) : 0;
+      };
+      const sec = (xml.match(/<w:sectPr[\s\S]*?<\/w:sectPr>/) || [""])[0];
+      const tw = (v) => (v ? (v / 20).toFixed(2) : "?");   // twips -> pt
+      const pgW = num(/<w:pgSz[^>]*w:w="(\d+)"/, sec);
+      const pgH = num(/<w:pgSz[^>]*w:h="(\d+)"/, sec);
+      const mL = num(/<w:pgMar[^>]*w:left="(\d+)"/, sec);
+      const mR = num(/<w:pgMar[^>]*w:right="(\d+)"/, sec);
+      const mT = num(/<w:pgMar[^>]*w:top="(\d+)"/, sec);
+      const mB = num(/<w:pgMar[^>]*w:bottom="(\d+)"/, sec);
+      const cols = num(/<w:cols[^>]*w:num="(\d+)"/, sec) || 1;
+      const csp = num(/<w:cols[^>]*w:space="(\d+)"/, sec);
+      const cw = pgW > 0 ? (pgW - mL - mR - csp * (cols - 1)) / cols / 20 : 0;
+
+      const gap = Number.isFinite(Number(gapPt)) && Number(gapPt) > 0 ? Number(gapPt) : 24;
+      const capW = Number.isFinite(Number(cap)) && Number(cap) > 0 ? Number(cap) : 224;
+      const rDen = Number.isFinite(Number(ratio)) && Number(ratio) > 0 ? Number(ratio) : 3;
+      let boxW = capW;
+      if (cw > 60) {
+        boxW = Math.min(capW, (cw - gap) / 2 - 2);
+        if (boxW < 60) boxW = 60;
+      }
+      const boxH = (boxW * rDen) / 4;
+      const pairW = 2 * boxW + gap;
+      const leftMl = cw > 0 ? Math.max(0, (cw - pairW) / 2) : 0;
+
+      // Existing floating VML shapes, so the caller can align with what is already there.
+      const shapes = (xml.match(/<v:shape\b[^>]*>/gi) || []).map((t) => {
+        const st = (t.match(/style="([^"]*)"/) || [, ""])[1];
+        const g = (k) => {
+          const m = st.match(new RegExp(k + ":([-0-9.]+)"));
+          return m ? m[1] : "";
+        };
+        return { id: (t.match(/(?<![:\w])id="([^"]*)"/) || [, "?"])[1], ml: g("margin-left"), mt: g("margin-top"), w: g("width"), h: g("height") };
+      });
+      const vImages = (xml.match(/<v:imagedata\b/gi) || []).length;
+
+      // A caption paragraph sample: the first paragraph whose text carries a stake-number pattern.
+      let capSample = "";
+      for (const pm of xml.match(/<w:p[ >][\s\S]*?<\/w:p>/g) || []) {
+        const t = (pm.match(/<w:t[^>]*>([^<]*)<\/w:t>/g) || []).map((s) => (s.match(/>([^<]*)</) || [, ""])[1]).join("");
+        if (/\d+\s*\+\s*\d+/.test(t) && t.trim().length <= 80) { capSample = t.trim(); break; }
+      }
+
+      const lines = [
+        file,
+        `页面 ${tw(pgW)} x ${tw(pgH)} pt；边距 左/右/上/下 = ${tw(mL)}/${tw(mR)}/${tw(mT)}/${tw(mB)} pt`,
+        `分欄 ${cols} 欄，欄间距 ${tw(csp)} pt → **欄宽 ${cw ? cw.toFixed(2) : "?"} pt**`,
+        "",
+        `建议图框：${boxW.toFixed(2)} x ${boxH.toFixed(2)} pt（上限 ${capW}，间距 ${gap}）`,
+        `一对两图总宽 ${pairW.toFixed(2)} pt → 左图 margin-left ${leftMl.toFixed(2)}、右图 ${(leftMl + boxW + gap).toFixed(2)}`,
+        "",
+        `文档已有浮动图（含真图 ${vImages} 张，v:shape ${shapes.length} 个）：`,
+      ];
+      if (shapes.length === 0) lines.push("  （无）");
+      shapes.slice(0, 20).forEach((s) => lines.push(`  ${s.id}  ml=${s.ml || "?"} mt=${s.mt || "?"} ${s.w || "?"} x ${s.h || "?"}`));
+      if (shapes.length > 20) lines.push(`  … 还有 ${shapes.length - 20} 个`);
+      lines.push("");
+      lines.push(capSample ? `图注段样本：${clip(capSample, 100)}` : "图注段样本：（没找到带桩号的段落）");
+      lines.push("提示：几何一律以本文档为准；跨文档套模板必然错位。批量插图请用 office_insert_photo_rows。");
+      return text(lines.join("\n"));
+    },
+  });
+
+  await sdk.tools.register({
     name: "office_convert_status",
-    description: "查询 Office 旧文档转换任务状态。传 jobId 查询单个任务；不传则列出最近 10 个任务。可看到阶段、百分比、成功/失败数和错误信息。",
+    description: "查询 Office 旧文档转换任务状态。传 jobId 查询单个任务；不传则列出最近 10 个任务。可看到阶段、百分比、成功数、跳过数（目标已存在时不会覆盖，计为跳过而非失败）、失败数与错误信息。",
     parameters: { type: "object", properties: { jobId: { type: "string", description: "可选任务 ID；省略时列出最近任务。" } }, required: [] },
     execute: async ({ jobId }) => {
       const selected = jobId ? jobs.get(String(jobId)) : null;

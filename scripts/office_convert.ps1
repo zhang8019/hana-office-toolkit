@@ -56,16 +56,6 @@ function Get-ZombieProcs {
     return $procs
 }
 
-function Test-KillableZombie($p) {
-    if ($p.name -like "soffice*") {
-        try {
-            $cl = (Get-CimInstance Win32_Process -Filter ("ProcessId=" + $p.pid) -ErrorAction SilentlyContinue).CommandLine
-            return ($cl -and ($cl -match "lo_profile_"))
-        } catch { return $false }
-    }
-    return (-not ([string]$p.title).Trim())
-}
-
 function Invoke-SweepWorker($action) {
     # The parent runs INSIDE the Hana sandbox, whose restricted process view cannot see (and
     # therefore cannot kill) Office instances started elsewhere. explorer.exe runs outside the
@@ -94,7 +84,7 @@ function Invoke-SweepWorker($action) {
 
 if ($SweepWorker) {
     # Runs outside the sandbox: sees every process, may delete temp dirs and kill zombies.
-    $payload = [ordered]@{ ok = $true; action = $WorkerAction; removed = 0; procs = @(); killed = @() }
+    $payload = [ordered]@{ ok = $true; action = $WorkerAction; removed = 0; procs = @(); killed = @(); candidates = @() }
     try {
         if ($WorkerAction -ne 'list') {
             $cut = (Get-Date).AddHours(-1)
@@ -108,15 +98,11 @@ if ($SweepWorker) {
         }
         $procs = @(Get-ZombieProcs)
         $payload.procs = $procs
-        if ($WorkerAction -ne 'list') {
-            $killed = @()
-            foreach ($p in $procs) {
-                if (Test-KillableZombie $p) {
-                    try { & taskkill.exe /PID $p.pid /T /F 2>$null | Out-Null; $killed += $p.pid } catch { }
-                }
-            }
-            $payload.killed = $killed
-        }
+        # Deliberately no killing here. The old rule was "no window title = automation leftover", but a
+        # WPS/Office editor window shows no title while a large document is still loading, so that rule
+        # kills real editing sessions (real incident 2026-10-09). Candidates are reported only.
+        $payload.killed = @()
+        $payload.candidates = @($procs | Where-Object { -not ([string]$_.title).Trim() })
     } catch {
         $payload.ok = $false
         $payload.error = $_.Exception.Message
@@ -139,7 +125,7 @@ if ($SweepTemp -or $ListOfficePids) {
     if ($ListOfficePids) {
         if ($procList.Count -eq 0) { "[]" } else { ConvertTo-Json -InputObject $procList -Depth 4 -Compress }
     } else {
-        ([pscustomobject]@{ ok = $true; removed = [int]$r.removed; procs = $procList; killed = @($r.killed | Where-Object { $_ -ne $null }) }) | ConvertTo-Json -Depth 6 -Compress
+        ([pscustomobject]@{ ok = $true; removed = [int]$r.removed; procs = $procList; killed = @($r.killed | Where-Object { $_ -ne $null }); candidates = @($r.candidates | Where-Object { $_ -ne $null }) }) | ConvertTo-Json -Depth 6 -Compress
     }
     exit 0
 }
@@ -403,6 +389,12 @@ function Set-OfficeAppQuiet($app, $kind) {
     foreach ($p in $pairs) { try { $app.($p[0]) = $p[1] } catch { } }
 }
 
+# A destination that already exists is not a failure: nothing was attempted and nothing was
+# overwritten. Recording it as "skipped" keeps it out of the failure count while staying visible.
+function Add-SkippedResult($src, $dest) {
+    [void]$results.Add([pscustomobject]@{ src = $src; dest = $dest; ok = $false; skipped = $true; error = "Destination already exists: $dest" })
+}
+
 function Convert-Word($list) {
     if ($list.Count -eq 0) { return }
     $word = $null
@@ -418,7 +410,7 @@ function Convert-Word($list) {
             Write-ProgressJson "word" $script:progressCurrent $totalItems $src $script:officePid
             $dest = Get-DestPath $src $(if ($script:comPdf) { ".pdf" } else { ".docx" })
             try {
-                if (Test-Path -LiteralPath $dest) { throw "Destination already exists: $dest" }
+                if (Test-Path -LiteralPath $dest) { Add-SkippedResult $src $dest; continue }
                 Write-ProgressJson "word-open" $script:progressCurrent $totalItems $src $script:officePid
                 $doc = $word.Documents.Open($src, $false, $true, $false)
                 Write-ProgressJson "word-opened" $script:progressCurrent $totalItems $src $script:officePid
@@ -457,7 +449,7 @@ function Convert-Excel($list) {
             Write-ProgressJson "excel" $script:progressCurrent $totalItems $src $script:officePid
             $dest = Get-DestPath $src $(if ($script:comPdf) { ".pdf" } else { ".xlsx" })
             try {
-                if (Test-Path -LiteralPath $dest) { throw "Destination already exists: $dest" }
+                if (Test-Path -LiteralPath $dest) { Add-SkippedResult $src $dest; continue }
                 $wb = $excel.Workbooks.Open($src, 0, $true)
                 if ($script:comPdf) { $wb.ExportAsFixedFormat(0, $dest) } else { $wb.SaveAs($dest, 51) }
                 $wb.Close($false)
@@ -486,7 +478,7 @@ function Convert-Ppt($list) {
             Write-ProgressJson "powerpoint" $script:progressCurrent $totalItems $src $script:officePid
             $dest = Get-DestPath $src $(if ($script:comPdf) { ".pdf" } else { ".pptx" })
             try {
-                if (Test-Path -LiteralPath $dest) { throw "Destination already exists: $dest" }
+                if (Test-Path -LiteralPath $dest) { Add-SkippedResult $src $dest; continue }
                 $pres = $ppt.Presentations.Open($src, $true, $false, $false)
                 if ($script:comPdf) { $pres.SaveAs($dest, 32) } else { $pres.SaveAs($dest, 24) }
                 $pres.Close()
@@ -531,7 +523,7 @@ function Convert-LibreOffice($list) {
         Write-ProgressJson $phase $script:progressCurrent $totalItems $src $script:officePid
         $dest = Get-DestPath $src $targetExt
         try {
-            if (Test-Path -LiteralPath $dest) { throw "Destination already exists: $dest" }
+            if (Test-Path -LiteralPath $dest) { Add-SkippedResult $src $dest; continue }
             $targetDir = Split-Path -Parent $dest
             if (-not (Test-Path -LiteralPath $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
             $convertTo = if ($it.filter) { $it.to + ":" + $it.filter } else { $it.to }

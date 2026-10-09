@@ -66,7 +66,7 @@
     <section class="card" id="sec-deps" hidden>
       <div class="card__row">
         <div class="card__title">环境依赖</div>
-        <div class="card__row"><button class="btn btn--ghost btn--compact" id="deps-refresh" type="button">重新检查</button><button class="btn btn--ghost btn--compact" id="deps-cleanup" type="button" title="结束无窗口的残留 Office/WPS 进程，并清理过期临时目录；你自己打开着的文档不受影响">清理残留</button></div>
+        <div class="card__row"><button class="btn btn--ghost btn--compact" id="deps-refresh" type="button">重新检查</button><button class="btn btn--ghost btn--compact" id="deps-cleanup" type="button" title="清理过期临时目录，并结束本 App 自己遗留的子进程；不会主动结束你自己打开着的 Office/WPS 进程">清理残留</button></div>
       </div>
       <p class="card__desc">首次使用或某功能报「未找到」时看这里：MS Office / WPS 是首选转换引擎（保原件版式），LibreOffice 负责回落格式（html/csv/rtf/odt 等）与 COM 失败时的兜底，officecli 负责 docx/xlsx/pptx 读写，uv 负责文档 MCP。</p>
       <div class="deps" id="deps-list"></div>
