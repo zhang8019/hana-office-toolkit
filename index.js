@@ -24,11 +24,12 @@ import { DocMcpClient } from "./lib/doc-mcp.js";
 
 export const name = "office-toolkit";
 
-const VERSION = "0.10.0";
+const VERSION = "0.10.1";
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const CONVERT_SCRIPT = path.join(SCRIPT_DIR, "scripts", "office_convert.ps1");
 const COMPOSE_CAPTION = path.join(SCRIPT_DIR, "scripts", "compose_caption.ps1");
 const INSERT_ROWS = path.join(SCRIPT_DIR, "scripts", "docx_insert_rows.ps1");
+const FIX_MEDIA = path.join(SCRIPT_DIR, "scripts", "fix_media_paths.ps1");
 // Accepted values for the `to` / `engine` options (keep in sync with the tool schema).
 const ALLOWED_TARGETS = ["pdf", "docx", "doc", "xlsx", "xls", "pptx", "ppt", "html", "txt", "csv", "rtf", "odt", "ods", "odp", "epub", "md"];
 const ALLOWED_ENGINES = ["auto", "office", "wps", "libreoffice"];
@@ -895,8 +896,9 @@ export default defineApp(async (sdk) => {
     parameters: {
       type: "object",
       properties: {
-        path: { type: "string", description: ".docx 文件路径。" },
+        path: { type: "string", description: ".docx 文件路径（**输入文件会被修改**；想保住原件请传 out）。" },
         image: { type: "string", description: "图片文件路径（png/jpg 等）。" },
+        out: { type: "string", description: "先复制到该路径，再在副本上操作；输入文件字节不变。推荐总是传它。" },
         anchorText: { type: "string", description: "插到包含这段文字的段落之后（可用 --after find: 定位）；省略则追加到文档末尾。" },
         parent: { type: "string", description: "父节点路径，默认 /body。" },
         inline: { type: "boolean", description: "true = 内联图（随文字走）；默认 false = 浮动锤定图。" },
@@ -918,17 +920,36 @@ export default defineApp(async (sdk) => {
         captionGap: { type: "number", description: "图与图注之间的间距（像素），默认 12。" },
         captionAlign: { type: "string", description: "图注对齐：center（默认）/ left。" },
         border: { type: "string", description: "描边：如 1pt:#FFC000、2pt #FF0000、#FFC000（只给颜色则默认 1pt）、none（不加）。单位支持 pt/cm/px。默认不加。officecli 本身无边框属性，这里是拿到图后按 paraId 精确定位 spPr 注入 <a:ln>。" },
+        fixMedia: { type: "boolean", description: "把 officecli 落在包根 media/ 的图片部件归位到 word/media/ 并把关系改成相对路径（默认 true）。有些老文档上它确实会落在包根，Word 能显示但其它工具可能不认。" },
         healCheck: { type: "boolean", description: "true 时在改完边框后跑一次 validate 校验文档结构，默认 true。" },
         dryRun: { type: "boolean", description: "true 时只回显将执行的 officecli 参数，不真写。" },
       },
       required: ["path", "image"],
     },
-    execute: async ({ path: p, image, anchorText, parent, inline, width, height, hPosition, vPosition, hRelative, vRelative, hAlign, vAlign, wrap, behindText, alt, caption, captionSizePt, captionFont, captionColor, captionGap, captionAlign, border, healCheck, dryRun }) => {
-      const file = String(p || "").trim();
+    execute: async ({ path: p, image, out, anchorText, parent, inline, width, height, hPosition, vPosition, hRelative, vRelative, hAlign, vAlign, wrap, behindText, alt, caption, captionSizePt, captionFont, captionColor, captionGap, captionAlign, border, fixMedia, healCheck, dryRun }) => {
+      const srcFile = String(p || "").trim();
       const img = String(image || "").trim();
-      if (!file) return fail("缺少 path（.docx 文件路径）。");
-      if (!/\.docx$/i.test(file)) return fail("只处理 .docx；老式 .doc 请先用 office_convert 转成 .docx。");
+      if (!srcFile) return fail("缺少 path（.docx 文件路径）。");
+      if (!/\.docx$/i.test(srcFile)) return fail("只处理 .docx；老式 .doc 请先用 office_convert 转成 .docx。");
       if (!img) return fail("缺少 image（图片路径）。");
+      let file = srcFile;
+      const extraNotes = [];
+
+      // officecli edits in place and has no output-path option, so "out" is honoured by working on a
+      // copy. Without it a failure would still leave the caller's input file modified (real report).
+      if (out !== undefined && out !== null && String(out).trim()) {
+        const dest = String(out).trim();
+        try {
+          const pwsh0 = await resolvePwsh();
+          const q = (v) => String(v).replace(/'/g, "''");
+          const cp = await run(pwsh0, ["-NoProfile", "-NonInteractive", "-Command", `Copy-Item -LiteralPath '${q(srcFile)}' -Destination '${q(dest)}' -Force`], { timeoutMs: 60_000 });
+          if (!cp.ok) return fail(`复制到 out 失败（${describe(cp)}）：${clip(combine(cp.stdout, cp.stderr) || cp.message, 500)}`);
+          file = dest;
+          extraNotes.push(`已在副本上操作：${dest}（输入文件未被改动）`);
+        } catch (e) {
+          return fail(`复制到 out 失败：${String(e && e.message ? e.message : e)}`);
+        }
+      }
 
       // Optional route: burn the caption into the picture so photo+caption go in as a single element.
       let effectiveImage = img;
@@ -999,8 +1020,27 @@ export default defineApp(async (sdk) => {
           "常见原因：图片路径不存在、anchorText 没匹配到段落、或文档正被 Word/WPS 占用。",
         );
       }
-      const out = clip(combine(r.stdout, r.stderr) || "(无输出)", 2000);
+      const outText = clip(combine(r.stdout, r.stderr) || "(无输出)", 2000);
       const extra = [];
+
+      // Release officecli's resident first: it pins the file, which would block the package rewrite below.
+      try { await cli(["close", file], { timeoutMs: 20_000 }); } catch { /* best effort */ }
+
+      if (fixMedia !== false) {
+        try {
+          const pwsh1 = await resolvePwsh();
+          const fm = await run(pwsh1, ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", FIX_MEDIA, "-Docx", file], { timeoutMs: TIMEOUT.run });
+          let info = null;
+          try { info = JSON.parse(String(fm.stdout).trim().split(/\r?\n/).at(-1)); } catch { /* report below */ }
+          if (fm.ok && info && Number(info.moved) > 0) {
+            extra.push(`已把 ${info.moved} 个图片部件从包根 media/ 归位到 word/media/（关系改为相对路径）`);
+          } else if (!fm.ok) {
+            extra.push(`图片归位跳过（${describe(fm)}）：${clip(combine(fm.stdout, fm.stderr) || fm.message, 300)}`);
+          }
+        } catch (e) {
+          extra.push(`图片归位跳过：${String(e && e.message ? e.message : e)}`);
+        }
+      }
 
       // Border. officecli's picture has no line/border property at all, so the stroke is injected as
       // <a:ln> into the picture's own pic:spPr, scoped by the paragraph id that add just reported.
@@ -1018,12 +1058,15 @@ export default defineApp(async (sdk) => {
       })();
 
       if (bw) {
-        const pid = (String(r.stdout || "").match(/paraId=([0-9A-Fa-f]+)/) || [])[1];
+          const pid = (String(r.stdout || "").match(/paraId=([0-9A-Fa-f]+)/) || [])[1];
         if (!pid) {
           extra.push(`边框未加：没能从 add 的返回里取到 paraId（原文：${clip(r.stdout, 200)}）。请用 office_cli_run 走 raw-set 自己加。`);
         } else {
           const frag = `<a:ln xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" w="${bw.emu}"><a:solidFill><a:srgbClr val="${bw.color}"/></a:solidFill></a:ln>`;
-          const xp = `//w:p[@w14:paraId='${pid}']//pic:spPr`;
+          // Prefix-free XPath on purpose. Legacy documents declare xmlns:w/wp/v/o/r at the root but
+          // declare xmlns:a and xmlns:pic INLINE at first use, and XPath's static context cannot see an
+          // inline declaration: any "pic:"/"a:" step fails with "Namespace prefix is not defined".
+          const xp = `//*[local-name()='p'][@*[local-name()='paraId']='${pid}']//*[local-name()='spPr']`;
           const br = await cli(["raw-set", file, "/document", "--xpath", xp, "--action", "append", "--xml", frag], { timeoutMs: TIMEOUT.run });
           if (br.ok) {
             extra.push(`已加描边 ${(bw.emu / 12700).toFixed(2)}pt #${bw.color}（定位 ${xp}）`);
@@ -1032,13 +1075,16 @@ export default defineApp(async (sdk) => {
               extra.push(`结构校验：${clip(combine(vr.stdout, vr.stderr) || "(无输出)", 200)}`);
             }
           } else {
-            extra.push(`边框注入失败（${describe(br)}）：${clip(combine(br.stdout, br.stderr) || br.message, 400)}`);
+            extra.push(`⚠ 部分成功：图片已插入，但描边注入失败（${describe(br)}）：${clip(combine(br.stdout, br.stderr) || br.message, 400)}`);
           }
         }
       } else {
         extra.push("未加描边（默认无框；需要时传 border=\"1pt:#FFC000\"）。");
       }
-      return text([out, capNotes.join("\n"), notes.join("\n"), extra.filter(Boolean).join("\n")].filter(Boolean).join("\n"));
+      // officecli keeps a resident open after an edit, which pins the file for tens of seconds. Closing
+      // it releases the handle immediately so the caller can inspect the artefact right away.
+      try { await cli(["close", file], { timeoutMs: 20_000 }); } catch { /* best effort */ }
+      return text([outText, capNotes.join("\n"), extraNotes.join("\n"), notes.join("\n"), extra.filter(Boolean).join("\n")].filter(Boolean).join("\n"));
     },
   });
 
@@ -1069,7 +1115,9 @@ export default defineApp(async (sdk) => {
       const base = (file.match(/([^\\\/]+)\.docx$/i) || [, "doc"])[1];
       const useGrid = grid !== undefined && grid !== null && grid !== "";
       const tag = useGrid ? `grid${Number(grid) > 0 ? Number(grid) : "auto"}` : `p${String(page || "1").replace(/[,\-]/g, "_")}`;
-      const outPath = String(out || "").trim() || `${dir}\\_preview\\${base}_${tag}.png`;
+      const outPathRaw = String(out || "").trim() || `${dir}\\_preview\\${base}_${tag}.png`;
+      // A bare name like "prev" would otherwise produce an extension-less file.
+      const outPath = /\.[A-Za-z0-9]{2,5}$/.test(outPathRaw) ? outPathRaw : `${outPathRaw}.png`;
 
       // officecli does not create missing parent directories (it fails with "Could not find a part
       // of the path"), so materialise the output folder first. The App's PowerShell child can write
