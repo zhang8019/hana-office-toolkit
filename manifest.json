@@ -2,12 +2,11 @@
   "manifestVersion": 2,
   "id": "office-toolkit",
   "name": "Office 工具箱",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "entry": "index.js",
   "capabilities": [
     "app/tools.expose-to-model",
-    "app/process.spawn",
-    "app/mcp.provide"
+    "app/process.spawn"
   ],
   "contributes": {
     "cards": [

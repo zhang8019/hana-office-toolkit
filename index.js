@@ -20,10 +20,11 @@ import {
   hasShellMetachars,
   combine,
 } from "./lib/office-core.js";
+import { DocMcpClient } from "./lib/doc-mcp.js";
 
 export const name = "office-toolkit";
 
-const VERSION = "0.9.0";
+const VERSION = "0.10.0";
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const CONVERT_SCRIPT = path.join(SCRIPT_DIR, "scripts", "office_convert.ps1");
 const COMPOSE_CAPTION = path.join(SCRIPT_DIR, "scripts", "compose_caption.ps1");
@@ -46,6 +47,19 @@ export default defineApp(async (sdk) => {
   if (!sdk.dataDir) throw new Error("App dataDir is unavailable; cannot safely persist conversion jobs.");
   const workDir = path.join(sdk.dataDir, "jobs");
   const ensureWorkDir = () => fs.mkdirSync(workDir, { recursive: true });
+
+  // ---------------------------------------------------------------- 托管文档 MCP（自建客户端）
+  // The host registers an App-provided MCP connector but never projects its tools into an agent's tool
+  // namespace (owner.kind === "app" is skipped when syncing install records). The App's OWN tools DO
+  // get exposed, so the App speaks MCP to the server itself and re-exports it through its own tools.
+  const docMcp = new DocMcpClient({
+    resolveExecutable: (o) => sdk.process.resolveExecutable(o),
+    logger: sdk.logger,
+  });
+  // Best effort: take the server down with us so repeated reloads do not stack uvx processes.
+  process.on("exit", () => { try { docMcp.stop(); } catch { /* exiting anyway */ } });
+  process.on("SIGTERM", () => { try { docMcp.stop(); } catch { /* exiting anyway */ } });
+  const DOC_MCP_TIMEOUT = 120_000;
 
   // ---------------------------------------------------------------- 进程执行
 
@@ -1377,6 +1391,88 @@ export default defineApp(async (sdk) => {
       lines.push(capSample ? `图注段样本：${clip(capSample, 100)}` : "图注段样本：（没找到带桩号的段落）");
       lines.push("提示：几何一律以本文档为准；跨文档套模板必然错位。批量插图请用 office_insert_photo_rows。");
       return text(lines.join("\n"));
+    },
+  });
+
+  await sdk.tools.register({
+    name: "office_doc_tools",
+    description:
+      "列出随包托管的文档 MCP（timeverse-office-doc，74 项，涵盖 Word 19 / Excel 16 / PPT 15 / PDF 16 / 模板会话 8）的工具清单。先看这里挑工具名，再用 office_doc_tool 传 name+arguments 调用。可选 filter 按关键字过滤、full=true 输出完整描述。需要本机有 uv/uvx；首次调用会拉起服务，冷启动可能十几秒。只读。",
+    parameters: {
+      type: "object",
+      properties: {
+        filter: { type: "string", description: "只列出名称/描述包含该字串的工具。" },
+        full: { type: "boolean", description: "true 时带上完整描述与参数名，默认只给一行摘要。" },
+      },
+      required: [],
+    },
+    execute: async ({ filter, full }) => {
+      let tools;
+      try {
+        tools = await docMcp.listTools();
+      } catch (e) {
+        return fail(
+          `文档 MCP 启动失败：${String(e && e.message ? e.message : e)}`,
+          `状态：${JSON.stringify(docMcp.status())}。先确认 uv/uvx 可用（office_deps_status），冷启动第一次可能要等一会儿；若持续失败，也可以用 office_deps_install target=uv。`,
+        );
+      }
+      const needle = String(filter || "").trim().toLowerCase();
+      const picked = tools.filter((t) => {
+        if (!needle) return true;
+        return (
+          String(t.name || "").toLowerCase().includes(needle) ||
+          String(t.description || "").toLowerCase().includes(needle)
+        );
+      });
+      if (picked.length === 0) return fail(`没有匹配「${filter}」的工具（共 ${tools.length} 项）。`);
+      const groups = new Map();
+      for (const t of picked) {
+        const g = String(t.name || "?").split("_")[0] || "其他";
+        if (!groups.has(g)) groups.set(g, []);
+        groups.get(g).push(t);
+      }
+      const lines = [`共 ${tools.length} 项，匹配 ${picked.length} 项${needle ? `（过滤：${filter}）` : ""}。`, ""];
+      for (const [g, list] of groups) {
+        lines.push(`【${g}】${list.length} 项`);
+        for (const t of list) {
+          const d = full === true ? clip(String(t.description || ""), 200) : clip(String(t.description || "").split(/\n/)[0], 60);
+          const req = full === true ? ` 必填[${((t.inputSchema && t.inputSchema.required) || []).join(",")}]` : "";
+          lines.push(`  ${t.name}  ${d}${req}`);
+        }
+      }
+      lines.push("", "用 office_doc_tool 传 { name, arguments } 调用。写操作先向用户确认参数。");
+      return text(lines.join("\n"));
+    },
+  });
+
+  await sdk.tools.register({
+    name: "office_doc_tool",
+    description:
+      "调用随包托管的文档 MCP（timeverse-office-doc）中的一项工具：把 name 与 arguments 原样转发。先用 office_doc_tools 查清单与参数名。Word/Excel/PPT/PDF 的增删改查与模板都在里面（如 word_add_image、excel_write、pdf_merge、doc_apply_template）。注意：它的 word_add_image 是文末内联图，不能浮动定位、也加不了边框；要插浮动图/图注请用 office_add_image / office_insert_photo_rows。写操作会修改文档，调用前先向用户确认。",
+    parameters: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "MCP 工具名（见 office_doc_tools，如 word_get_info）。" },
+        arguments: { type: "object", description: "传给该工具的参数对象。" },
+      },
+      required: ["name"],
+    },
+    execute: async ({ name, arguments: args }) => {
+      const toolName = String(name || "").trim();
+      if (!toolName) return fail("缺少 name（MCP 工具名）。先用 office_doc_tools 查清单。");
+      let res;
+      try {
+        res = await docMcp.call(toolName, args || {}, DOC_MCP_TIMEOUT);
+      } catch (e) {
+        return fail(
+          `调用「${toolName}」失败：${String(e && e.message ? e.message : e)}`,
+          `状态：${JSON.stringify(docMcp.status())}。先确认工具名在清单里（office_doc_tools）；服务器刚崩溃的话再试一次会自动重启。`,
+        );
+      }
+      const extra = res.other && res.other.length ? `\n（另有非文本内容：${res.other.join(", ")}）` : "";
+      const body = clip(res.structured ? JSON.stringify(res.structured, null, 2) : res.text, 20000) || "（无文本输出）";
+      if (!res.ok) return fail(`${toolName} 报告错误：\n${body}${extra}`);
+      return text(`${toolName} 执行成功：\n\n${body}${extra}`);
     },
   });
 

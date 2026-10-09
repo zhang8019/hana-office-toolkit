@@ -71,7 +71,15 @@
 | `office_insert_caption` | 插入文字图注（可克隆文档自身图注段；一欄两条按空格分隔） | 写 |
 | `office_insert_photo_rows` | **按文档自身版式批量插照片行**（克隆原语；隐形表格 + cantSplit 防拆散） | 写 |
 | `office_render_preview` | 渲染页面预览图（走 officecli `view screenshot`，原生 Word 渲染） | 读 |
+| `office_doc_tools` | 列出随包托管的文档 MCP 工具清单（74 项：Word 19 / Excel 16 / PPT 15 / PDF 16 / 模板会话 8） | 读 |
+| `office_doc_tool` | 调用上述 MCP 的一项工具（传 `name` + `arguments`） | 读/写 |
 | `office_cleanup` | 清理临时目录与本 App 自己遗留的子进程（**不猜测、不误杀**） | 写 |
+
+### 文档 MCP 为什么由 App 自己托管
+
+宿主会为一个 App 声明的 MCP 连接器启动进程并授权工具，但**不会把工具投影进 agent 的工具命名空间**（同步安装记录时 `owner.kind === "app"` 被跳过）。App 自己的工具则正常暴露，所以 App 直接与 `uvx timeverse-office-doc-mcp` 讲 MCP 协议，再通过 `office_doc_tool` 转出来。因此本 App 不再声明 `mcp.json`，也不需要 `app/mcp.provide`。
+
+服务端有路径白名单（前缀匹配，`OFFICE_ALLOWED_DIRS`）：App 启动它时默认设为**用户主目录 + C–H 盘根**，可用环境变量 `OFFICE_ALLOWED_DIRS` 覆盖。不设这个，任何调用都会被服务端自己的沙箱挡回。
 
 ### 两条插图路线怎么选
 
